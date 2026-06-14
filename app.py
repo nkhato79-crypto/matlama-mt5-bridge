@@ -9,7 +9,11 @@ def health():
 
 @app.route("/mcp", methods=["GET", "POST"])
 def mcp():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "serverInfo": {"name": "matlama-mt5-bridge", "version": "1.0.0"}
+    })
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
