@@ -19,4 +19,4 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-MT5_VPS_URL  = os.getenv("MT5_VPS_URL", "http://173.225
+", "hMT5_VPS_URL  = os.getenv("MT5_VPS_URL", "http://173.225.110.145:5000")
