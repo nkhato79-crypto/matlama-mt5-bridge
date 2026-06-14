@@ -1,22 +1,16 @@
-"""
-Matlama MT5 Bridge - Flask API
-Gold (XAUUSD) trading bridge between external signals and MetaTrader 5
-"""
-
 import os
-import logging
-from datetime import datetime
-from functools import wraps
-
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
-import requests as http_requests
-
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-", "hMT5_VPS_URL  = os.getenv("MT5_VPS_URL", "http://173.225.110.145:5000")
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+@app.route("/mcp", methods=["GET", "POST"])
+def mcp():
+    return jsonify({"status": "ok"})
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
