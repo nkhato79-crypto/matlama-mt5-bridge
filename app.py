@@ -1,4 +1,4 @@
-import os
+    import os
 import logging
 from datetime import datetime
 from functools import wraps
@@ -101,7 +101,7 @@ def health():
 
 @app.route("/mcp", methods=["GET", "POST"])
 def mcp():
-    return jsonify({"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "matlama-mt5-bridge", "version": "1.0.0"}})
+    return jsonify({"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "matlama-mt5-bridge", "version": "2.0.0"}})
 
 @app.route("/signal", methods=["POST"])
 @require_api_key
@@ -111,6 +111,72 @@ def signal():
     if direction not in ("BUY", "SELL"):
         return jsonify({"error": "direction must be BUY or SELL"}), 400
     return jsonify(evaluate_signal(direction))
+
+@app.route("/hft_signal", methods=["POST"])
+@require_api_key
+def hft_signal():
+    data = request.get_json() or {}
+    market = data.get("market_data", {})
+
+    price          = market.get("price", 0)
+    spread         = market.get("spread", 0)
+    volume         = market.get("volume", 0)
+    price_velocity = market.get("price_velocity", 0)
+    atr            = market.get("atr", 1)
+
+    vol_pct = (atr / price * 100) if price else 2.0
+    if vol_pct < 1.5:
+        spoof_thresh, mom_thresh = 65, 80
+    elif vol_pct < 2.5:
+        spoof_thresh, mom_thresh = 60, 70
+    elif vol_pct < 3.5:
+        spoof_thresh, mom_thresh = 55, 65
+    else:
+        spoof_thresh, mom_thresh = 50, 60
+
+    momentum_score = min(100, price_velocity * 15)
+    normal_spread  = atr * 0.05
+    spread_ratio   = (spread / normal_spread) if normal_spread else 1
+    spoofing_score = min(100, spread_ratio * 40 + (volume / 1000) * 10)
+    flash_crash    = price_velocity > 8 and volume > 5000
+    confidence     = (spoofing_score + momentum_score) / 2
+
+    if flash_crash:
+        return jsonify({
+            "signal": "FLASH_CRASH",
+            "qualified": True,
+            "confidence": 90,
+            "spoofing_score": round(spoofing_score),
+            "momentum_score": round(momentum_score)
+        })
+
+    if spoofing_score > spoof_thresh and momentum_score > mom_thresh * 0.9:
+        return jsonify({
+            "signal": "SELL_RALLY",
+            "qualified": True,
+            "confidence": round(confidence),
+            "spoofing_score": round(spoofing_score),
+            "momentum_score": round(momentum_score),
+            "vol_regime": round(vol_pct, 2)
+        })
+
+    if spoofing_score > 65 and price < 3200:
+        return jsonify({
+            "signal": "BUY_SUPPORT",
+            "qualified": True,
+            "confidence": 72,
+            "spoofing_score": round(spoofing_score),
+            "momentum_score": round(momentum_score)
+        })
+
+    return jsonify({
+        "signal": "NO_SIGNAL",
+        "qualified": False,
+        "confidence": round(confidence),
+        "spoofing_score": round(spoofing_score),
+        "momentum_score": round(momentum_score),
+        "vol_regime": round(vol_pct, 2)
+    })
 
 @app.route("/trade", methods=["POST"])
 @require_api_key
