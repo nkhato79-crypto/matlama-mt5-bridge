@@ -1,4 +1,4 @@
-    import os
+import os
 import logging
 from datetime import datetime
 from functools import wraps
@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 MT5_VPS_URL = os.getenv("MT5_VPS_URL", "")
 API_KEY = os.getenv("API_KEY", "")
-SYMBOL = os.getenv("SYMBOL", "XAUUSD")
+SYMBOL = os.getenv("SYMBOL", "GOLD")
 LOT_SIZE = float(os.getenv("LOT_SIZE", 0.01))
 COT_BIAS = os.getenv("COT_BIAS", "NEUTRAL").upper()
 DEALER_GAMMA = float(os.getenv("DEALER_GAMMA", 0))
@@ -103,7 +103,7 @@ def health():
 def mcp():
     return jsonify({"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "matlama-mt5-bridge", "version": "2.0.0"}})
 
-@app.route("/signal", methods=["POST"])
+@app.route("/signal", methods=["GET", "POST"])
 @require_api_key
 def signal():
     data = request.get_json() or {}
