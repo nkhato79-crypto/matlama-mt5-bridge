@@ -104,7 +104,6 @@ def mcp():
     return jsonify({"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "matlama-mt5-bridge", "version": "2.0.0"}})
 
 @app.route("/signal", methods=["GET", "POST"])
-@require_api_key
 def signal():
     data = request.get_json() or {}
     direction = data.get("direction", "").upper()
