@@ -106,10 +106,23 @@ def mcp():
 @app.route("/signal", methods=["GET", "POST"])
 def signal():
     data = request.get_json() or {}
-    direction = data.get("direction", "").upper()
-    if direction not in ("BUY", "SELL"):
-        return jsonify({"error": "direction must be BUY or SELL"}), 400
-    return jsonify(evaluate_signal(direction))
+    direction = data.get("direction", None)
+    if not direction:
+        buy = evaluate_signal("BUY")
+        sell = evaluate_signal("SELL")
+        if buy["score"] >= sell["score"]:
+            direction = "BUY"
+            result = buy
+        else:
+            direction = "SELL"
+            result = sell
+    else:
+        if direction not in ("BUY", "SELL"):
+            return jsonify({"error": "direction must be BUY or SELL"}), 400
+        result = evaluate_signal(direction)
+    result["action"] = direction if result["score"] >= 4 else "HOLD"
+    result["confidence"] = int((result["score"] / 5) * 100)
+    return jsonify(result)
 
 @app.route("/hft_signal", methods=["POST"])
 @require_api_key
