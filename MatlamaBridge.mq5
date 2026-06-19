@@ -10,7 +10,7 @@
 //--- Input Parameters
 input string   RenderURL    = "https://matlama-mt5-bridge.onrender.com";
 input string   APIKey       = "Yu4minawena!";
-input string   Symbol_      = "XAUUSD";
+input string   Symbol_      = "GOLD";
 input double   LotSize      = 0.01;
 input int      SL_Pips      = 50;
 input int      TP_Pips      = 100;
