@@ -1,7 +1,7 @@
 flask==3.0.3
-python-dotenv==1.0.1
-requests==2.32.3
-google-auth==2.29.0
-google-auth-oauthlib==1.2.0
-google-api-python-client==2.127.0
 gunicorn==22.0.0
+python-dotenv==1.0.1
+yfinance==0.2.40
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
