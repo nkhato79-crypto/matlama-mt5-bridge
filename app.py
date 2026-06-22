@@ -15,7 +15,7 @@ app = Flask(__name__)
 API_KEY        = os.getenv("API_KEY", "Yu4minawena!")
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "XAUUSD")
 LOT_SIZE       = float(os.getenv("LOT_SIZE", 0.01))
-COT_BIAS       = os.getenv("COT_BIAS", "BUY").upper()
+COT_BIAS       = os.getenv("COT_BIAS", "NEUTRAL").upper()
 DEALER_GAMMA   = float(os.getenv("DEALER_GAMMA", 0))
 
 # ── Data fetch ─────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ def require_api_key(f):
 # ── Signal layers ──────────────────────────────────────────────────────────
 
 def layer_cot(direction):
-    if COT_BIAS == "BUY":
+    if COT_BIAS == "NEUTRAL":
         return True
     return COT_BIAS == direction
 
