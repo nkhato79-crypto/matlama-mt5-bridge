@@ -55,7 +55,7 @@ def require_api_key(f):
 # ── Signal layers ──────────────────────────────────────────────────────────
 
 def layer_cot(direction):
-    if COT_BIAS == "NEUTRAL":
+    if COT_BIAS == "BUY":
         return True
     return COT_BIAS == direction
 
