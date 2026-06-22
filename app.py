@@ -34,7 +34,7 @@ def get_rates(symbol: str, period: str = "5d", interval: str = "1h") -> pd.DataF
                      progress=False, auto_adjust=True)
     if df.empty:
         raise ValueError(f"No data returned for {ticker}")
-    df.columns = [c.lower() for c in df.columns]
+    df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower() for c in df.columns]
     return df
 
 # ── Auth ───────────────────────────────────────────────────────────────────
