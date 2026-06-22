@@ -4,8 +4,6 @@ from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-import yfinance as yf
-import pandas as pd
 
 load_dotenv()
 
@@ -20,28 +18,23 @@ LOT_SIZE       = float(os.getenv("LOT_SIZE", 0.01))
 COT_BIAS       = os.getenv("COT_BIAS", "NEUTRAL").upper()
 DEALER_GAMMA   = float(os.getenv("DEALER_GAMMA", 0))
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Data fetch ─────────────────────────────────────────────────────────────
 
 def get_rates(period="5d", interval="1h"):
-    """Fetch XAUUSD (Gold Futures) data from yfinance, return clean DataFrame."""
     try:
-        df = yf.download("GC=F", period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        if df.empty:
+        import yfinance as yf
+        import pandas as pd
+        ticker = yf.Ticker("GC=F")
+        df = ticker.history(period=period, interval=interval, auto_adjust=True)
+        if df is None or df.empty:
+            log.warning("Empty dataframe from yfinance")
             return None
-
-        # yfinance sometimes returns MultiIndex columns — flatten them
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0].lower() for col in df.columns]
-        else:
-            df.columns = [str(col).lower() for col in df.columns]
-
-        # Ensure required columns exist
+        # ticker.history() returns simple string columns
+        df.columns = [str(c).lower() for c in df.columns]
         required = {"open", "high", "low", "close"}
         if not required.issubset(set(df.columns)):
-            log.error(f"Missing columns. Got: {df.columns.tolist()}")
+            log.error(f"Missing columns: {df.columns.tolist()}")
             return None
-
         return df.dropna()
     except Exception as e:
         log.error(f"get_rates error: {e}")
@@ -67,9 +60,7 @@ def layer_cot(direction):
     return COT_BIAS == direction
 
 def layer_gamma(direction):
-    if direction == "BUY":
-        return DEALER_GAMMA <= 0
-    return DEALER_GAMMA >= 0
+    return DEALER_GAMMA <= 0 if direction == "BUY" else DEALER_GAMMA >= 0
 
 def layer_structure(direction, df):
     if df is None or len(df) < 10:
@@ -77,41 +68,45 @@ def layer_structure(direction, df):
     recent = df.tail(5)
     prior  = df.iloc[-10:-5]
     if direction == "BUY":
-        return (recent["high"].max() > prior["high"].max() and
-                recent["low"].min()  > prior["low"].min())
-    return (recent["high"].max() < prior["high"].max() and
-            recent["low"].min()  < prior["low"].min())
+        return (float(recent["high"].max()) > float(prior["high"].max()) and
+                float(recent["low"].min())  > float(prior["low"].min()))
+    return (float(recent["high"].max()) < float(prior["high"].max()) and
+            float(recent["low"].min())  < float(prior["low"].min()))
 
 def layer_price_action(direction, df):
     if df is None or len(df) < 2:
         return False
     last      = df.iloc[-1]
-    body      = abs(float(last["close"]) - float(last["open"]))
-    wick_up   = float(last["high"])  - max(float(last["close"]), float(last["open"]))
-    wick_down = min(float(last["close"]), float(last["open"])) - float(last["low"])
+    close     = float(last["close"])
+    open_     = float(last["open"])
+    high      = float(last["high"])
+    low       = float(last["low"])
+    body      = abs(close - open_)
+    wick_up   = high - max(close, open_)
+    wick_down = min(close, open_) - low
     if body == 0:
         return False
     if direction == "BUY":
-        return float(last["close"]) > float(last["open"]) and wick_down < body * 0.5
-    return float(last["close"]) < float(last["open"]) and wick_up < body * 0.5
+        return close > open_ and wick_down < body * 0.5
+    return close < open_ and wick_up < body * 0.5
 
 def layer_patterns(direction, df):
     if df is None or len(df) < 20:
         return False
-    lows  = df["low"].values.astype(float)
-    highs = df["high"].values.astype(float)
+    lows  = [float(x) for x in df["low"].values]
+    highs = [float(x) for x in df["high"].values]
     if direction == "BUY":
-        l1 = lows[-20:-10].min()
-        l2 = lows[-10:].min()
+        l1 = min(lows[-20:-10])
+        l2 = min(lows[-10:])
         return l1 > 0 and abs(l1 - l2) / l1 < 0.005
-    h1 = highs[-20:-10].max()
-    h2 = highs[-10:].max()
+    h1 = max(highs[-20:-10])
+    h2 = max(highs[-10:])
     return h1 > 0 and abs(h1 - h2) / h1 < 0.005
 
 def evaluate_signal(direction):
     direction = direction.upper()
-    df_h1  = get_rates(period="5d",  interval="1h")
-    df_h4  = get_rates(period="30d", interval="4h")
+    df_h1 = get_rates(period="5d",  interval="1h")
+    df_h4 = get_rates(period="30d", interval="4h")
 
     layers = {
         "cot_cftc":         layer_cot(direction),
@@ -153,7 +148,7 @@ def mcp():
     return jsonify({
         "protocolVersion": "2024-11-05",
         "capabilities":    {},
-        "serverInfo":      {"name": "matlama-mt5-bridge", "version": "3.1.0"}
+        "serverInfo":      {"name": "matlama-mt5-bridge", "version": "3.2.0"}
     })
 
 @app.route("/signal", methods=["GET", "POST"])
@@ -166,7 +161,7 @@ def signal():
         symbol    = data.get("symbol", DEFAULT_SYMBOL)
         direction = data.get("direction", None)
 
-    log.info(f"Signal request | symbol={symbol} direction={direction}")
+    log.info(f"Signal | symbol={symbol} direction={direction}")
 
     if direction:
         direction = direction.upper()
