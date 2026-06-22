@@ -15,7 +15,7 @@ app = Flask(__name__)
 API_KEY        = os.getenv("API_KEY", "Yu4minawena!")
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "XAUUSD")
 LOT_SIZE       = float(os.getenv("LOT_SIZE", 0.01))
-COT_BIAS       = os.getenv("COT_BIAS", "NEUTRAL").upper()
+COT_BIAS       = os.getenv("COT_BIAS", "BUY").upper()
 DEALER_GAMMA   = float(os.getenv("DEALER_GAMMA", 0))
 
 # ── Data fetch ─────────────────────────────────────────────────────────────
