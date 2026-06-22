@@ -7,16 +7,20 @@ from dotenv import load_dotenv
 import requests as http_requests
 
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-MT5_VPS_URL = os.getenv("MT5_VPS_URL", "")
+MT5_VPS_URL = os.getenv("MT5_VPS_URL", "").rstrip("/")
 API_KEY = os.getenv("API_KEY", "")
-SYMBOL = os.getenv("SYMBOL", "GOLD")
+DEFAULT_SYMBOL = os.getenv("SYMBOL", "XAUUSD")
 LOT_SIZE = float(os.getenv("LOT_SIZE", 0.01))
 COT_BIAS = os.getenv("COT_BIAS", "NEUTRAL").upper()
 DEALER_GAMMA = float(os.getenv("DEALER_GAMMA", 0))
+
+# ── Auth ───────────────────────────────────────────────────────────────────
 
 def require_api_key(f):
     @wraps(f)
@@ -27,16 +31,27 @@ def require_api_key(f):
         return f(*args, **kwargs)
     return decorated
 
-def call_vps(endpoint, method="GET", data=None):
+# ── VPS caller with safe timeout ───────────────────────────────────────────
+
+def call_vps(endpoint, method="GET", data=None, symbol="XAUUSD"):
+    if not MT5_VPS_URL:
+        log.warning("MT5_VPS_URL not set — skipping VPS call")
+        return {"error": "MT5_VPS_URL not configured"}
     try:
         url = f"{MT5_VPS_URL}{endpoint}"
         if method == "POST":
-            resp = http_requests.post(url, json=data, timeout=15)
+            resp = http_requests.post(url, json=data, timeout=10)
         else:
-            resp = http_requests.get(url, timeout=15)
+            resp = http_requests.get(url, timeout=10)
         return resp.json()
+    except http_requests.Timeout:
+        log.error(f"VPS call timed out: {endpoint}")
+        return {"error": "VPS timeout"}
     except Exception as e:
+        log.error(f"VPS call failed: {e}")
         return {"error": str(e)}
+
+# ── Signal layers ──────────────────────────────────────────────────────────
 
 def check_cot(direction):
     if COT_BIAS == "NEUTRAL":
@@ -48,9 +63,10 @@ def check_gamma(direction):
         return DEALER_GAMMA <= 0
     return DEALER_GAMMA >= 0
 
-def check_structure(direction):
-    data = call_vps(f"/rates?symbol={SYMBOL}&timeframe=H1&count=20")
+def check_structure(direction, symbol):
+    data = call_vps(f"/rates?symbol={symbol}&timeframe=H1&count=20", symbol=symbol)
     if "error" in data or not data.get("rates"):
+        log.warning(f"Structure check failed: {data.get('error', 'no rates')}")
         return False
     rates = data["rates"]
     highs = [r["high"] for r in rates]
@@ -59,9 +75,10 @@ def check_structure(direction):
         return highs[-1] > highs[-5] and lows[-1] > lows[-5]
     return highs[-1] < highs[-5] and lows[-1] < lows[-5]
 
-def check_price_action(direction):
-    data = call_vps(f"/rates?symbol={SYMBOL}&timeframe=H1&count=3")
+def check_price_action(direction, symbol):
+    data = call_vps(f"/rates?symbol={symbol}&timeframe=H1&count=3", symbol=symbol)
     if "error" in data or not data.get("rates"):
+        log.warning(f"Price action check failed: {data.get('error', 'no rates')}")
         return False
     last = data["rates"][-1]
     body = abs(last["close"] - last["open"])
@@ -71,45 +88,77 @@ def check_price_action(direction):
         return last["close"] > last["open"] and wick_down < body
     return last["close"] < last["open"] and wick_up < body
 
-def check_patterns(direction):
-    data = call_vps(f"/rates?symbol={SYMBOL}&timeframe=H4&count=30")
+def check_patterns(direction, symbol):
+    data = call_vps(f"/rates?symbol={symbol}&timeframe=H4&count=30", symbol=symbol)
     if "error" in data or not data.get("rates"):
+        log.warning(f"Pattern check failed: {data.get('error', 'no rates')}")
         return False
     rates = data["rates"]
     lows = [r["low"] for r in rates]
     highs = [r["high"] for r in rates]
     if direction == "BUY":
         l1, l2 = min(lows[-15:-5]), min(lows[-5:])
-        return abs(l1 - l2) / l1 < 0.005
+        return abs(l1 - l2) / l1 < 0.005 if l1 else False
     h1, h2 = max(highs[-15:-5]), max(highs[-5:])
-    return abs(h1 - h2) / h1 < 0.005
+    return abs(h1 - h2) / h1 < 0.005 if h1 else False
 
-def evaluate_signal(direction):
+def evaluate_signal(direction, symbol):
     layers = {
-        "cot_cftc": check_cot(direction),
-        "dealer_gamma": check_gamma(direction),
-        "market_structure": check_structure(direction),
-        "price_action": check_price_action(direction),
-        "chart_patterns": check_patterns(direction),
+        "cot_cftc":        check_cot(direction),
+        "dealer_gamma":    check_gamma(direction),
+        "market_structure": check_structure(direction, symbol),
+        "price_action":    check_price_action(direction, symbol),
+        "chart_patterns":  check_patterns(direction, symbol),
     }
     score = sum(layers.values())
-    return {"layers": layers, "score": score, "threshold": 4, "qualified": score >= 4, "direction": direction}
+    return {
+        "layers": layers,
+        "score": score,
+        "threshold": 4,
+        "qualified": score >= 4,
+        "direction": direction,
+        "symbol": symbol,
+    }
+
+# ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "symbol": SYMBOL, "timestamp": datetime.utcnow().isoformat()})
+    return jsonify({
+        "status": "ok",
+        "symbol": DEFAULT_SYMBOL,
+        "vps_configured": bool(MT5_VPS_URL),
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
 @app.route("/mcp", methods=["GET", "POST"])
 def mcp():
-    return jsonify({"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "matlama-mt5-bridge", "version": "2.0.0"}})
+    return jsonify({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "serverInfo": {"name": "matlama-mt5-bridge", "version": "2.1.0"}
+    })
 
 @app.route("/signal", methods=["GET", "POST"])
 def signal():
-    data = request.get_json() or {}
-    direction = data.get("direction", None)
+    # Accept symbol from query params (GET) or JSON body (POST)
+    if request.method == "GET":
+        symbol = request.args.get("symbol", DEFAULT_SYMBOL)
+        direction = request.args.get("direction", None)
+    else:
+        data = request.get_json() or {}
+        symbol = data.get("symbol", DEFAULT_SYMBOL)
+        direction = data.get("direction", None)
+
+    # Normalise symbol — accept both GOLD and XAUUSD
+    if symbol.upper() == "GOLD":
+        symbol = "XAUUSD"
+
+    log.info(f"Signal request: symbol={symbol} direction={direction}")
+
     if not direction:
-        buy = evaluate_signal("BUY")
-        sell = evaluate_signal("SELL")
+        buy = evaluate_signal("BUY", symbol)
+        sell = evaluate_signal("SELL", symbol)
         if buy["score"] >= sell["score"]:
             direction = "BUY"
             result = buy
@@ -117,9 +166,11 @@ def signal():
             direction = "SELL"
             result = sell
     else:
+        direction = direction.upper()
         if direction not in ("BUY", "SELL"):
             return jsonify({"error": "direction must be BUY or SELL"}), 400
-        result = evaluate_signal(direction)
+        result = evaluate_signal(direction, symbol)
+
     result["action"] = direction if result["score"] >= 4 else "HOLD"
     result["confidence"] = int((result["score"] / 5) * 100)
     return jsonify(result)
@@ -129,14 +180,14 @@ def signal():
 def hft_signal():
     data = request.get_json() or {}
     market = data.get("market_data", {})
-
-    price          = market.get("price", 0)
-    spread         = market.get("spread", 0)
-    volume         = market.get("volume", 0)
+    price = market.get("price", 0)
+    spread = market.get("spread", 0)
+    volume = market.get("volume", 0)
     price_velocity = market.get("price_velocity", 0)
-    atr            = market.get("atr", 1)
+    atr = market.get("atr", 1)
 
     vol_pct = (atr / price * 100) if price else 2.0
+
     if vol_pct < 1.5:
         spoof_thresh, mom_thresh = 65, 80
     elif vol_pct < 2.5:
@@ -147,11 +198,11 @@ def hft_signal():
         spoof_thresh, mom_thresh = 50, 60
 
     momentum_score = min(100, price_velocity * 15)
-    normal_spread  = atr * 0.05
-    spread_ratio   = (spread / normal_spread) if normal_spread else 1
+    normal_spread = atr * 0.05
+    spread_ratio = (spread / normal_spread) if normal_spread else 1
     spoofing_score = min(100, spread_ratio * 40 + (volume / 1000) * 10)
-    flash_crash    = price_velocity > 8 and volume > 5000
-    confidence     = (spoofing_score + momentum_score) / 2
+    flash_crash = price_velocity > 8 and volume > 5000
+    confidence = (spoofing_score + momentum_score) / 2
 
     if flash_crash:
         return jsonify({
@@ -195,13 +246,22 @@ def hft_signal():
 def trade():
     data = request.get_json() or {}
     direction = data.get("direction", "").upper()
+    symbol = data.get("symbol", DEFAULT_SYMBOL)
+
     if direction not in ("BUY", "SELL"):
         return jsonify({"error": "direction must be BUY or SELL"}), 400
+
     if not data.get("skip_signal_check"):
-        sig = evaluate_signal(direction)
+        sig = evaluate_signal(direction, symbol)
         if not sig["qualified"]:
             return jsonify({"executed": False, "reason": "Signal did not meet 4/5 threshold", "signal": sig})
-    result = call_vps("/trade", method="POST", data={"direction": direction, "lot": data.get("lot", LOT_SIZE), "sl_pips": data.get("sl_pips", 50), "tp_pips": data.get("tp_pips", 100)})
+
+    result = call_vps("/trade", method="POST", data={
+        "direction": direction,
+        "lot": data.get("lot", LOT_SIZE),
+        "sl_pips": data.get("sl_pips", 50),
+        "tp_pips": data.get("tp_pips", 100)
+    })
     return jsonify({"executed": True, **result})
 
 @app.route("/close", methods=["POST"])
@@ -224,9 +284,11 @@ def history():
 def cmd():
     data = request.get_json() or {}
     command = data.get("cmd", "").upper()
+    symbol = data.get("symbol", DEFAULT_SYMBOL)
     log.info(f"CMD: {command}")
+
     if command in ("BUY", "SELL"):
-        sig = evaluate_signal(command)
+        sig = evaluate_signal(command, symbol)
         if not sig["qualified"]:
             return jsonify({"executed": False, "cmd": command, "reason": "Signal did not meet 4/5 threshold"})
         result = call_vps("/trade", method="POST", data={"direction": command, "lot": data.get("lot", LOT_SIZE)})
@@ -235,6 +297,7 @@ def cmd():
         return jsonify(call_vps("/close", method="POST", data={}))
     elif command == "STATUS":
         return jsonify(call_vps("/positions"))
+
     return jsonify({"error": f"Unknown command: {command}"}), 400
 
 if __name__ == "__main__":
