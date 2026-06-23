@@ -1,5 +1,6 @@
 import os
 import logging
+yf.set_tz_cache_location("/tmp/yfinance_cache")
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify
