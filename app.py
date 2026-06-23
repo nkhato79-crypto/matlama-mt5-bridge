@@ -1,6 +1,5 @@
 import os
 import logging
-yf.set_tz_cache_location("/tmp/yfinance_cache")
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify
@@ -26,8 +25,7 @@ def get_rates(period="5d", interval="1h"):
         import yfinance as yf
         import pandas as pd
         ticker = yf.Ticker("GC=F")
-        df = ticker.history(period=period, interval=interval, 
-                   auto_adjust=True, actions=False)
+        df = ticker.history(period=period, interval=interval, auto_adjust=True)
         if df is None or df.empty:
             log.warning("Empty dataframe from yfinance")
             return None
