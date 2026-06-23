@@ -1,228 +1,291 @@
-import os
-import logging
-from datetime import datetime
-from functools import wraps
-from flask import Flask, request, jsonify
-from dotenv import load_dotenv
+//+------------------------------------------------------------------+
+//|                                              MatlamaBridge.mq5   |
+//|                                          Matlama Tech © 2026     |
+//|                     Self-contained 5-layer signal engine         |
+//+------------------------------------------------------------------+
+#property copyright "Matlama Tech 2026"
+#property version   "3.00"
+#property strict
 
-load_dotenv()
+#include <Trade\Trade.mqh>
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+//--- Input Parameters
+input string   EA_Name       = "MatlamaBridge v3";
+input double   LotSize       = 0.01;
+input int      SL_Pips       = 50;
+input int      TP_Pips       = 100;
+input int      Slippage      = 10;
+input int      PollSeconds   = 30;
+input int      MagicNumber   = 20260101;
+input bool     AutoTrade     = false;
+input double   MaxDailyLoss  = 100.0;
 
-app = Flask(__name__)
+// --- COT & Gamma (update weekly from CFTC report)
+input string   COT_Bias      = "BUY";   // BUY, SELL, or NEUTRAL
+input double   DealerGamma   = -0.5;    // Negative = amplifies moves
+input int      ScoreThreshold = 3;      // Minimum score to trade (out of 5)
 
-API_KEY        = os.getenv("API_KEY", "Yu4minawena!")
-DEFAULT_SYMBOL = os.getenv("SYMBOL", "XAUUSD")
-LOT_SIZE       = float(os.getenv("LOT_SIZE", 0.01))
-COT_BIAS       = os.getenv("COT_BIAS", "NEUTRAL").upper()
-DEALER_GAMMA   = float(os.getenv("DEALER_GAMMA", 0))
+//--- Global Variables
+CTrade   trade;
+datetime LastCheck        = 0;
+string   LastSignal       = "";
+double   dailyStartBalance;
+datetime dailyResetTime;
+int      atrHandle;
 
-# ── Data fetch ─────────────────────────────────────────────────────────────
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   atrHandle = iATR(_Symbol, PERIOD_H1, 14);
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: ATR handle failed");
+      return(INIT_FAILED);
+   }
 
-def get_rates(period="5d", interval="1h"):
-    try:
-        import yfinance as yf
-        import pandas as pd
-        ticker = yf.Ticker("GC=F")
-        df = ticker.history(period=period, interval=interval, auto_adjust=True)
-        if df is None or df.empty:
-            log.warning("Empty dataframe from yfinance")
-            return None
-        # ticker.history() returns simple string columns
-        df.columns = [str(c).lower() for c in df.columns]
-        required = {"open", "high", "low", "close"}
-        if not required.issubset(set(df.columns)):
-            log.error(f"Missing columns: {df.columns.tolist()}")
-            return None
-        return df.dropna()
-    except Exception as e:
-        log.error(f"get_rates error: {e}")
-        return None
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
-# ── Auth ───────────────────────────────────────────────────────────────────
+   dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   dailyResetTime    = TimeCurrent();
 
-def require_api_key(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth = request.headers.get("Authorization", "")
-        key  = request.args.get("api_key", "")
-        if auth == f"Bearer {API_KEY}" or key == API_KEY:
-            return f(*args, **kwargs)
-        return jsonify({"error": "Unauthorized"}), 401
-    return decorated
+   Print("=== ", EA_Name, " initialized ===");
+   Print("Symbol: ",     _Symbol);
+   Print("AutoTrade: ",  AutoTrade ? "ENABLED" : "DISABLED");
+   Print("COT Bias: ",   COT_Bias);
+   Print("Threshold: ",  ScoreThreshold, "/5");
+   Print("Lot Size: ",   LotSize);
 
-# ── Signal layers ──────────────────────────────────────────────────────────
+   return(INIT_SUCCEEDED);
+}
 
-def layer_cot(direction):
-    if COT_BIAS == "NEUTRAL":
-        return True
-    return COT_BIAS == direction
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
+   Print(EA_Name, " stopped. Reason: ", reason);
+}
 
-def layer_gamma(direction):
-    return DEALER_GAMMA <= 0 if direction == "BUY" else DEALER_GAMMA >= 0
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Reset daily balance at midnight
+   MqlDateTime now, reset;
+   TimeToStruct(TimeCurrent(), now);
+   TimeToStruct(dailyResetTime, reset);
+   if(now.day != reset.day)
+   {
+      dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      dailyResetTime    = TimeCurrent();
+      Print("Daily balance reset: ", dailyStartBalance);
+   }
 
-def layer_structure(direction, df):
-    if df is None or len(df) < 10:
-        return False
-    recent = df.tail(5)
-    prior  = df.iloc[-10:-5]
-    if direction == "BUY":
-        return (float(recent["high"].max()) > float(prior["high"].max()) and
-                float(recent["low"].min())  > float(prior["low"].min()))
-    return (float(recent["high"].max()) < float(prior["high"].max()) and
-            float(recent["low"].min())  < float(prior["low"].min()))
+   // Daily loss limit
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
+   {
+      Print("Daily loss limit reached. Halting.");
+      return;
+   }
 
-def layer_price_action(direction, df):
-    if df is None or len(df) < 2:
-        return False
-    last      = df.iloc[-1]
-    close     = float(last["close"])
-    open_     = float(last["open"])
-    high      = float(last["high"])
-    low       = float(last["low"])
-    body      = abs(close - open_)
-    wick_up   = high - max(close, open_)
-    wick_down = min(close, open_) - low
-    if body == 0:
-        return False
-    if direction == "BUY":
-        return close > open_ and wick_down < body * 0.5
-    return close < open_ and wick_up < body * 0.5
+   // Poll throttle
+   if((TimeCurrent() - LastCheck) < PollSeconds)
+      return;
+   LastCheck = TimeCurrent();
 
-def layer_patterns(direction, df):
-    if df is None or len(df) < 20:
-        return False
-    lows  = [float(x) for x in df["low"].values]
-    highs = [float(x) for x in df["high"].values]
-    if direction == "BUY":
-        l1 = min(lows[-20:-10])
-        l2 = min(lows[-10:])
-        return l1 > 0 and abs(l1 - l2) / l1 < 0.005
-    h1 = max(highs[-20:-10])
-    h2 = max(highs[-10:])
-    return h1 > 0 and abs(h1 - h2) / h1 < 0.005
+   // ── Run signal engine ──────────────────────────────────────────
+   int buyScore  = EvaluateSignal("BUY");
+   int sellScore = EvaluateSignal("SELL");
 
-def evaluate_signal(direction):
-    direction = direction.upper()
-    df_h1 = get_rates(period="5d",  interval="1h")
-    df_h4 = get_rates(period="30d", interval="4h")
+   string action   = "HOLD";
+   int    score    = 0;
 
-    layers = {
-        "cot_cftc":         layer_cot(direction),
-        "dealer_gamma":     layer_gamma(direction),
-        "market_structure": layer_structure(direction, df_h1),
-        "price_action":     layer_price_action(direction, df_h1),
-        "chart_patterns":   layer_patterns(direction, df_h4),
-    }
-    score = sum(layers.values())
-    price = float(df_h1["close"].iloc[-1]) if df_h1 is not None and len(df_h1) > 0 else 0
+   if(buyScore >= sellScore && buyScore >= ScoreThreshold)
+   {
+      action = "BUY";
+      score  = buyScore;
+   }
+   else if(sellScore > buyScore && sellScore >= ScoreThreshold)
+   {
+      action = "SELL";
+      score  = sellScore;
+   }
 
-    return {
-        "direction":  direction,
-        "symbol":     "XAUUSD",
-        "layers":     {k: bool(v) for k, v in layers.items()},
-        "score":      score,
-        "threshold":  3,
-        "qualified":  score >= 3,
-        "action":     direction if score >= 3 else "HOLD",
-        "confidence": int((score / 5) * 100),
-        "price":      price,
-        "timestamp":  datetime.utcnow().isoformat(),
-    }
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   Print("Signal: ", action, " | BUY=", buyScore, "/5 | SELL=", sellScore,
+         "/5 | Gold: $", DoubleToString(price, 2));
 
-# ── Routes ─────────────────────────────────────────────────────────────────
+   if(!AutoTrade || action == "HOLD")
+      return;
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "status":       "ok",
-        "symbol":       DEFAULT_SYMBOL,
-        "cot_bias":     COT_BIAS,
-        "dealer_gamma": DEALER_GAMMA,
-        "timestamp":    datetime.utcnow().isoformat()
-    })
+   // Skip duplicate
+   if(action == LastSignal)
+      return;
 
-@app.route("/mcp", methods=["GET", "POST"])
-def mcp():
-    return jsonify({
-        "protocolVersion": "2024-11-05",
-        "capabilities":    {},
-        "serverInfo":      {"name": "matlama-mt5-bridge", "version": "3.2.0"}
-    })
+   // Check for existing position
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetTicket(i) > 0 &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         Print("Position already open. Skipping.");
+         return;
+      }
+   }
 
-@app.route("/signal", methods=["GET", "POST"])
-def signal():
-    if request.method == "GET":
-        symbol    = request.args.get("symbol", DEFAULT_SYMBOL)
-        direction = request.args.get("direction", None)
-    else:
-        data      = request.get_json() or {}
-        symbol    = data.get("symbol", DEFAULT_SYMBOL)
-        direction = data.get("direction", None)
+   // Execute trade
+   double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pipSize = point * 10;
+   double sl_dist = SL_Pips * pipSize;
+   double tp_dist = TP_Pips * pipSize;
+   bool   success = false;
 
-    log.info(f"Signal | symbol={symbol} direction={direction}")
+   if(action == "BUY")
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double sl  = NormalizeDouble(ask - sl_dist, _Digits);
+      double tp  = NormalizeDouble(ask + tp_dist, _Digits);
+      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "MB_BUY");
+      if(success)
+         Print("BUY executed | Ask:", ask, " SL:", sl, " TP:", tp);
+      else
+         Print("BUY failed: ", trade.ResultRetcodeDescription());
+   }
+   else if(action == "SELL")
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double sl  = NormalizeDouble(bid + sl_dist, _Digits);
+      double tp  = NormalizeDouble(bid - tp_dist, _Digits);
+      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "MB_SELL");
+      if(success)
+         Print("SELL executed | Bid:", bid, " SL:", sl, " TP:", tp);
+      else
+         Print("SELL failed: ", trade.ResultRetcodeDescription());
+   }
 
-    if direction:
-        direction = direction.upper()
-        if direction not in ("BUY", "SELL"):
-            return jsonify({"error": "direction must be BUY or SELL"}), 400
-        return jsonify(evaluate_signal(direction))
+   if(success) LastSignal = action;
+}
 
-    buy  = evaluate_signal("BUY")
-    sell = evaluate_signal("SELL")
-    result = buy if buy["score"] >= sell["score"] else sell
-    result["buy_score"]  = buy["score"]
-    result["sell_score"] = sell["score"]
-    return jsonify(result)
+//+------------------------------------------------------------------+
+//| Evaluate signal score for a given direction (0-5)                |
+//+------------------------------------------------------------------+
+int EvaluateSignal(string direction)
+{
+   int score = 0;
 
-@app.route("/hft_signal", methods=["POST"])
-@require_api_key
-def hft_signal():
-    data           = request.get_json() or {}
-    market         = data.get("market_data", {})
-    price          = float(market.get("price", 0))
-    spread         = float(market.get("spread", 0))
-    volume         = float(market.get("volume", 0))
-    price_velocity = float(market.get("price_velocity", 0))
-    atr            = float(market.get("atr", 1)) or 1
+   // Layer 1: COT/CFTC Bias
+   if(COT_Bias == "NEUTRAL") score++;
+   else if(COT_Bias == direction) score++;
 
-    vol_pct = (atr / price * 100) if price else 2.0
-    if vol_pct < 1.5:   spoof_thresh, mom_thresh = 65, 80
-    elif vol_pct < 2.5: spoof_thresh, mom_thresh = 60, 70
-    elif vol_pct < 3.5: spoof_thresh, mom_thresh = 55, 65
-    else:               spoof_thresh, mom_thresh = 50, 60
+   // Layer 2: Dealer Gamma
+   if(direction == "BUY"  && DealerGamma <= 0) score++;
+   if(direction == "SELL" && DealerGamma >= 0) score++;
 
-    momentum_score = min(100, price_velocity * 15)
-    normal_spread  = atr * 0.05
-    spread_ratio   = (spread / normal_spread) if normal_spread else 1
-    spoofing_score = min(100, spread_ratio * 40 + (volume / 1000) * 10)
-    flash_crash    = price_velocity > 8 and volume > 5000
-    confidence     = (spoofing_score + momentum_score) / 2
+   // Layer 3: Market Structure (H1 - Higher Highs/Lower Lows)
+   if(CheckStructure(direction)) score++;
 
-    if flash_crash:
-        return jsonify({"signal": "FLASH_CRASH", "qualified": True, "confidence": 90,
-                        "spoofing_score": round(spoofing_score), "momentum_score": round(momentum_score)})
-    if spoofing_score > spoof_thresh and momentum_score > mom_thresh * 0.9:
-        return jsonify({"signal": "SELL_RALLY", "qualified": True, "confidence": round(confidence),
-                        "spoofing_score": round(spoofing_score), "momentum_score": round(momentum_score)})
-    if spoofing_score > 65 and price < 3200:
-        return jsonify({"signal": "BUY_SUPPORT", "qualified": True, "confidence": 72,
-                        "spoofing_score": round(spoofing_score), "momentum_score": round(momentum_score)})
-    return jsonify({"signal": "NO_SIGNAL", "qualified": False, "confidence": round(confidence),
-                    "spoofing_score": round(spoofing_score), "momentum_score": round(momentum_score)})
+   // Layer 4: Price Action (H1 - Momentum candle)
+   if(CheckPriceAction(direction)) score++;
 
-@app.route("/cmd", methods=["POST"])
-@require_api_key
-def cmd():
-    data    = request.get_json() or {}
-    command = data.get("cmd", "").upper()
-    log.info(f"CMD: {command}")
-    if command in ("BUY", "SELL"):
-        sig = evaluate_signal(command)
-        return jsonify({"executed": sig["qualified"], "cmd": command, "signal": sig,
-                        "reason": "Signal qualified" if sig["qualified"] else "Score below 4/5 threshold"})
-    return jsonify({"error": f"Unknown command: {command}"}), 400
+   // Layer 5: Chart Patterns (H4 - Double top/bottom)
+   if(CheckPatterns(direction)) score++;
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//| Layer 3: Market Structure                                         |
+//+------------------------------------------------------------------+
+bool CheckStructure(string direction)
+{
+   double highs[], lows[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows,  true);
+
+   if(CopyHigh(_Symbol, PERIOD_H1, 0, 20, highs) < 20) return false;
+   if(CopyLow(_Symbol,  PERIOD_H1, 0, 20, lows)  < 20) return false;
+
+   // Recent 5 bars vs prior 5 bars
+   double recentHigh = highs[0];
+   double recentLow  = lows[0];
+   double priorHigh  = highs[5];
+   double priorLow   = lows[5];
+
+   for(int i = 1; i < 5; i++)
+   {
+      if(highs[i] > recentHigh) recentHigh = highs[i];
+      if(lows[i]  < recentLow)  recentLow  = lows[i];
+   }
+   for(int i = 5; i < 10; i++)
+   {
+      if(highs[i] > priorHigh) priorHigh = highs[i];
+      if(lows[i]  < priorLow)  priorLow  = lows[i];
+   }
+
+   if(direction == "BUY")
+      return (recentHigh > priorHigh && recentLow > priorLow);
+   else
+      return (recentHigh < priorHigh && recentLow < priorLow);
+}
+
+//+------------------------------------------------------------------+
+//| Layer 4: Price Action                                             |
+//+------------------------------------------------------------------+
+bool CheckPriceAction(string direction)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, PERIOD_H1, 0, 3, rates) < 3) return false;
+
+   double open  = rates[0].open;
+   double close = rates[0].close;
+   double high  = rates[0].high;
+   double low   = rates[0].low;
+   double body  = MathAbs(close - open);
+
+   if(body == 0) return false;
+
+   double wickUp   = high  - MathMax(close, open);
+   double wickDown = MathMin(close, open) - low;
+
+   if(direction == "BUY")
+      return (close > open && wickDown < body * 0.5);
+   else
+      return (close < open && wickUp   < body * 0.5);
+}
+
+//+------------------------------------------------------------------+
+//| Layer 5: Chart Patterns (Double top/bottom on H4)                |
+//+------------------------------------------------------------------+
+bool CheckPatterns(string direction)
+{
+   double highs[], lows[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows,  true);
+
+   if(CopyHigh(_Symbol, PERIOD_H4, 0, 30, highs) < 30) return false;
+   if(CopyLow(_Symbol,  PERIOD_H4, 0, 30, lows)  < 30) return false;
+
+   if(direction == "BUY")
+   {
+      // Double bottom — two similar lows
+      double low1 = lows[10];
+      double low2 = lows[20];
+      for(int i = 10; i < 20; i++) if(lows[i] < low1) low1 = lows[i];
+      for(int i = 20; i < 30; i++) if(lows[i] < low2) low2 = lows[i];
+      if(low1 == 0) return false;
+      return (MathAbs(low1 - low2) / low1 < 0.005);
+   }
+   else
+   {
+      // Double top — two similar highs
+      double high1 = highs[10];
+      double high2 = highs[20];
+      for(int i = 10; i < 20; i++) if(highs[i] > high1) high1 = highs[i];
+      for(int i = 20; i < 30; i++) if(highs[i] > high2) high2 = highs[i];
+      if(high1 == 0) return false;
+      return (MathAbs(high1 - high2) / high1 < 0.005);
+   }
+}
