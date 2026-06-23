@@ -1,0 +1,204 @@
+//+------------------------------------------------------------------+
+//|                                          MatlamaBridgeHFT.mq5    |
+//|                                          Matlama Tech © 2026     |
+//|                     Self-contained HFT manipulation detector      |
+//+------------------------------------------------------------------+
+#property copyright "Matlama Tech 2026"
+#property version   "3.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- Input Parameters
+input string   EA_Name       = "MatlamaBridgeHFT v3";
+input double   LotSize       = 0.01;
+input int      SL_Pips       = 30;
+input int      TP_Pips       = 60;
+input int      Slippage      = 10;
+input int      MagicNumber   = 20260102;
+input bool     AutoTrade     = false;
+input double   MaxDailyLoss  = 50.0;
+input int      SpreadThresh  = 35;    // Max spread in points to trade
+input double   VelocityThresh = 3.0; // Min pip/sec to detect manipulation
+
+//--- Global Variables
+CTrade   trade;
+double   dailyStartBalance;
+datetime dailyResetTime;
+int      atrHandle;
+double   lastBid          = 0;
+datetime lastTickTime     = 0;
+bool     inCooldown       = false;
+datetime cooldownEnd      = 0;
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   atrHandle = iATR(_Symbol, PERIOD_H1, 14);
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: ATR handle failed");
+      return(INIT_FAILED);
+   }
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   dailyResetTime    = TimeCurrent();
+
+   Print("=== ", EA_Name, " initialized ===");
+   Print("Symbol: ",         _Symbol);
+   Print("AutoTrade: ",      AutoTrade ? "ENABLED" : "DISABLED");
+   Print("Spread Thresh: ",  SpreadThresh, " points");
+   Print("Velocity Thresh: ", VelocityThresh, " pips/sec");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
+   Print(EA_Name, " stopped. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Reset daily balance at midnight
+   MqlDateTime now, reset;
+   TimeToStruct(TimeCurrent(), now);
+   TimeToStruct(dailyResetTime, reset);
+   if(now.day != reset.day)
+   {
+      dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      dailyResetTime    = TimeCurrent();
+      Print("Daily balance reset: ", dailyStartBalance);
+   }
+
+   // Daily loss limit
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
+   {
+      Print("Daily loss limit reached. Halting.");
+      return;
+   }
+
+   // Cooldown check
+   if(inCooldown && TimeCurrent() < cooldownEnd)
+      return;
+   inCooldown = false;
+
+   // Get market data
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   long   spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   // ATR
+   double atrBuf[];
+   ArraySetAsSeries(atrBuf, true);
+   double atr = 0;
+   if(CopyBuffer(atrHandle, 0, 0, 2, atrBuf) > 0)
+      atr = atrBuf[0];
+
+   // Price velocity (pips per second)
+   double velocity = 0;
+   datetime nowTime = TimeCurrent();
+   if(lastBid > 0 && lastTickTime > 0)
+   {
+      double elapsed = (double)(nowTime - lastTickTime);
+      if(elapsed > 0)
+         velocity = MathAbs(bid - lastBid) / (point * 10) / elapsed;
+   }
+   lastBid      = bid;
+   lastTickTime = nowTime;
+
+   // Spread filter — don't trade in wide spread
+   if(spread > SpreadThresh)
+      return;
+
+   // ── HFT Signal Detection ───────────────────────────────────────
+
+   string signal    = "NO_SIGNAL";
+   bool   qualified = false;
+
+   // Flash crash detection — extreme velocity
+   if(velocity > VelocityThresh * 3)
+   {
+      signal    = "FLASH_CRASH";
+      qualified = true;
+      Print("FLASH CRASH detected | Velocity: ", DoubleToString(velocity, 2), " pips/sec");
+   }
+   // Spoofing/manipulation — high velocity + wide spread
+   else if(velocity > VelocityThresh && spread > SpreadThresh * 0.7)
+   {
+      // Price dropped fast — likely buy opportunity after manipulation
+      if(bid < lastBid)
+      {
+         signal    = "BUY_SUPPORT";
+         qualified = true;
+      }
+      // Price spiked fast — likely sell opportunity
+      else
+      {
+         signal    = "SELL_RALLY";
+         qualified = true;
+      }
+      Print("Manipulation detected | Signal: ", signal,
+            " | Velocity: ", DoubleToString(velocity, 2),
+            " | Spread: ", spread);
+   }
+
+   if(!qualified || !AutoTrade)
+      return;
+
+   // Check for existing HFT position
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetTicket(i) > 0 &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         Print("HFT position already open. Skipping.");
+         return;
+      }
+   }
+
+   // Execute trade
+   double pipSize = point * 10;
+   double sl_dist = SL_Pips * pipSize;
+   double tp_dist = TP_Pips * pipSize;
+   bool   success = false;
+
+   if(signal == "SELL_RALLY" || signal == "FLASH_CRASH")
+   {
+      double sl = NormalizeDouble(bid + sl_dist, _Digits);
+      double tp = NormalizeDouble(bid - tp_dist, _Digits);
+      success   = trade.Sell(LotSize, _Symbol, 0, sl, tp, "HFT_" + signal);
+      if(success)
+         Print("HFT SELL | Bid:", bid, " SL:", sl, " TP:", tp);
+      else
+         Print("HFT SELL failed: ", trade.ResultRetcodeDescription());
+   }
+   else if(signal == "BUY_SUPPORT")
+   {
+      double sl = NormalizeDouble(ask - sl_dist, _Digits);
+      double tp = NormalizeDouble(ask + tp_dist, _Digits);
+      success   = trade.Buy(LotSize, _Symbol, 0, sl, tp, "HFT_BUY");
+      if(success)
+         Print("HFT BUY | Ask:", ask, " SL:", sl, " TP:", tp);
+      else
+         Print("HFT BUY failed: ", trade.ResultRetcodeDescription());
+   }
+
+   // 5 minute cooldown after trade
+   if(success)
+   {
+      inCooldown  = true;
+      cooldownEnd = TimeCurrent() + 300;
+      Print("HFT cooldown active for 5 minutes");
+   }
+}
