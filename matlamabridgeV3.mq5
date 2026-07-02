@@ -55,7 +55,7 @@ int      macdHandle;
 int      adxHandle;
 
 //--- CSV logging
-string   CSV_PATH = "C:\\Matlama\\hft_trades.csv";
+string   CSV_PATH = "hft_trades.csv";
 ulong    lastLoggedTicket = 0;
 
 //+------------------------------------------------------------------+
@@ -63,11 +63,10 @@ ulong    lastLoggedTicket = 0;
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen("hft_trades.csv", FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
    if(handle == INVALID_HANDLE)
    {
-      // File doesn't exist — create with header
-      handle = FileOpen("hft_trades.csv", FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -83,23 +82,37 @@ void InitCSV()
 }
 
 //+------------------------------------------------------------------+
-//| Log closed trade to CSV                                          |
+//| Log closed trades to CSV — FIXED: append mode, no truncation    |
 //+------------------------------------------------------------------+
 void LogClosedTrades()
 {
-   HistorySelect(TimeCurrent() - 86400*7, TimeCurrent()); // last 7 days
+   HistorySelect(TimeCurrent() - 86400*7, TimeCurrent());
    int total = HistoryDealsTotal();
+   if(total == 0) return;
 
-   int handle = FileOpen("hft_trades.csv",
-                         FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ|FILE_COMMON);
+   // Check if there are any new trades before opening file
+   bool hasNew = false;
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(ticket <= lastLoggedTicket) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      hasNew = true;
+      break;
+   }
+   if(!hasNew) return;
+
+   // Open in append mode — READ|WRITE then seek to end
+   int handle = FileOpen(CSV_PATH,
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
    if(handle == INVALID_HANDLE)
    {
-      // Append mode — reopen correctly
-      handle = FileOpen("hft_trades.csv",
-                        FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON);
-      if(handle == INVALID_HANDLE) return;
-      FileSeek(handle, 0, SEEK_END);
+      Print("CSV ERROR: Cannot open for append. Error:", GetLastError());
+      return;
    }
+   FileSeek(handle, 0, SEEK_END);
 
    for(int i = 0; i < total; i++)
    {
@@ -109,36 +122,33 @@ void LogClosedTrades()
       if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
 
       long dealEntry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
-      if(dealEntry != DEAL_ENTRY_OUT) continue; // only log closed trades
+      if(dealEntry != DEAL_ENTRY_OUT) continue;
 
-      long   dtype      = HistoryDealGetInteger(ticket, DEAL_TYPE);
-      string typeStr    = (dtype == DEAL_TYPE_BUY) ? "BUY" : "SELL";
-      datetime openTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
-      double   price    = HistoryDealGetDouble(ticket, DEAL_PRICE);
-      double   volume   = HistoryDealGetDouble(ticket, DEAL_VOLUME);
-      double   profit   = HistoryDealGetDouble(ticket, DEAL_PROFIT);
-      double   swap     = HistoryDealGetDouble(ticket, DEAL_SWAP);
-      double   comm     = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      long     dtype     = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      string   typeStr   = (dtype == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+      datetime closeTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      double   closePrice = HistoryDealGetDouble(ticket, DEAL_PRICE);
+      double   volume    = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+      double   profit    = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      double   swap      = HistoryDealGetDouble(ticket, DEAL_SWAP);
+      double   comm      = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
 
-      // Get open price from matching entry deal
-      double openPrice  = 0;
+      double   openPrice = 0;
       datetime entryTime = 0;
-      ulong posId = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      ulong posId = (ulong)HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
       for(int j = 0; j < total; j++)
       {
          ulong t2 = HistoryDealGetTicket(j);
-         if(HistoryDealGetInteger(t2, DEAL_POSITION_ID) == posId &&
+         if((ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID) == posId &&
             HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
          {
-            openPrice  = HistoryDealGetDouble(t2,  DEAL_PRICE);
-            entryTime  = (datetime)HistoryDealGetInteger(t2, DEAL_TIME);
+            openPrice = HistoryDealGetDouble(t2, DEAL_PRICE);
+            entryTime = (datetime)HistoryDealGetInteger(t2, DEAL_TIME);
             break;
          }
       }
 
-      int durationMin = (int)((openTime - entryTime) / 60);
-
-      // Score at close time (approximate)
+      int durationMin = (int)((closeTime - entryTime) / 60);
       int bScore = EvaluateSignal("BUY");
       int sScore = EvaluateSignal("SELL");
 
@@ -146,10 +156,10 @@ void LogClosedTrades()
          (string)ticket,
          _Symbol,
          typeStr,
-         TimeToString(entryTime, TIME_DATE|TIME_MINUTES),
-         TimeToString(openTime,  TIME_DATE|TIME_MINUTES),
-         DoubleToString(openPrice, _Digits),
-         DoubleToString(price,     _Digits),
+         TimeToString(entryTime,   TIME_DATE|TIME_MINUTES),
+         TimeToString(closeTime,   TIME_DATE|TIME_MINUTES),
+         DoubleToString(openPrice,  _Digits),
+         DoubleToString(closePrice, _Digits),
          DoubleToString(volume, 2),
          DoubleToString(profit, 2),
          DoubleToString(swap,   2),
@@ -161,7 +171,7 @@ void LogClosedTrades()
       );
 
       lastLoggedTicket = ticket;
-      Print("Trade logged to CSV | Ticket:", ticket, " Profit:", profit);
+      Print("Trade logged | Ticket:", ticket, " Profit:", profit);
    }
 
    FileClose(handle);
@@ -231,7 +241,6 @@ void OnTick()
       return;
    }
 
-   // Log any newly closed trades every tick check
    LogClosedTrades();
 
    if((TimeCurrent() - LastCheck) < PollSeconds) return;
@@ -295,8 +304,6 @@ void OnTick()
    if(success) LastSignal = action;
 }
 
-//+------------------------------------------------------------------+
-//| All layer functions unchanged below                              |
 //+------------------------------------------------------------------+
 int EvaluateSignal(string direction)
 {
@@ -409,6 +416,7 @@ bool CheckMACD(string direction)
    bool belowZero =(macd<0 && macd<macdPrev);
    return (crossDown||belowZero);
 }
+
 bool CheckADX(string direction)
 {
    double adxBuf[], diPlus[], diMinus[];
