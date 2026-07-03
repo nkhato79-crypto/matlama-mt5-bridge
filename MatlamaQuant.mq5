@@ -552,3 +552,107 @@ int OnInit()
    Print("Symbol: ",       _Symbol);
    Print("AutoTrade: ",    AutoTrade ? "ENABLED" : "DISABLED");
    Print("Magic: ",        MagicNumber
+Print("Strategy: Fibonacci Reactive | 5-Layer Confirmation");
+   Print("CSV: quant_trades.csv");
+
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   if(rsiHandle  != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+   if(macdHandle != INVALID_HANDLE) IndicatorRelease(macdHandle);
+   Print(EA_Name, " stopped. Reason: ", reason);
+}
+
+void OnTick()
+{
+   MqlDateTime now, reset;
+   TimeToStruct(TimeCurrent(), now);
+   TimeToStruct(dailyResetTime, reset);
+   if(now.day != reset.day)
+   {
+      dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      dailyResetTime    = TimeCurrent();
+      Print("Daily balance reset: ", dailyStartBalance);
+   }
+
+   double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
+   {
+      Print("Daily loss limit reached. Halting.");
+      return;
+   }
+
+   LogClosedTrades();
+   CheckTimeExit();
+
+   if((TimeCurrent() - LastCheck) < PollSeconds) return;
+   LastCheck = TimeCurrent();
+
+   CalculateFibLevels();
+
+   if(!AutoTrade) return;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetTicket(i) > 0 &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         Print("Position open. Monitoring...");
+         return;
+      }
+   }
+
+   double price      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double nearestFib = 0;
+   string direction  = "";
+
+   if(!CheckFibProximity(price, nearestFib, direction))
+   { Print("Signal: HOLD | Layer 1 failed"); return; }
+
+   if(!CheckVelocity(direction))
+   { Print("Signal: HOLD | Layer 2 failed"); return; }
+
+   if(!CheckVolumeSurge())
+   { Print("Signal: HOLD | Layer 3 failed"); return; }
+
+   if(!CheckFibBreak(nearestFib, direction))
+   { Print("Signal: HOLD | Layer 4 failed"); return; }
+
+   if(!CheckMomentumAcceleration(direction))
+   { Print("Signal: HOLD | Layer 5 failed"); return; }
+
+   if(!CheckDynamicSpread(nearestFib))
+   { Print("Signal: HOLD | Spread too wide"); return; }
+
+   Print("=== SIGNAL CONFIRMED | All 5 layers passed | Direction: ", direction, " ===");
+
+   double sl, tp1, tp2, tp3;
+   GetTradeLevels(direction, nearestFib, sl, tp1, tp2, tp3);
+
+   bool success = false;
+
+   if(direction == "BUY")
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      sl  = NormalizeDouble(sl,  _Digits);
+      tp1 = NormalizeDouble(tp1, _Digits);
+      success = trade.Buy(LotSize, _Symbol, 0, sl, tp1, "MQ_BUY");
+      if(success)
+         Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1, " | Fib:", nearestFib);
+      else
+         Print("BUY failed: ", trade.ResultRetcodeDescription());
+   }
+   else if(direction == "SELL")
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      sl  = NormalizeDouble(sl,  _Digits);
+      tp1 = NormalizeDouble(tp1, _Digits);
+      success = trade.Sell(LotSize, _Symbol, 0, sl, tp1, "MQ_SELL");
+      if(success)
+         Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1, " | Fib:", nearestFib);
+      else
+         Print("SELL failed: ", trade.ResultRetcodeDescription());
+   }
+}
