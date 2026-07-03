@@ -1,6 +1,8 @@
 """
-Matlama Gold Trading — ML Threshold Server v2
+Matlama Gold Trading — ML Threshold Server v3
+Production-ready with Waitress WSGI server
 Serves both MatlamaBridgeV3 and MatlamaQuant thresholds
+
 Endpoints:
   GET /                    — health check
   GET /threshold           — MatlamaBridgeV3 threshold
@@ -8,9 +10,8 @@ Endpoints:
   POST /predict            — MatlamaBridgeV3 prediction
   POST /quant_predict      — MatlamaQuant prediction
 
-Flask on localhost:6000
-Task Scheduler: Matlama_ThresholdServer (on startup)
-API Key: Yu4minawena!
+Runs on localhost:6000 via Waitress (production WSGI)
+Task Scheduler: Matlama_ThresholdServer (on startup, SYSTEM)
 """
 
 import json
@@ -21,20 +22,17 @@ from datetime import datetime, timezone
 import joblib
 import numpy as np
 from flask import Flask, jsonify, request
+from waitress import serve
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_DIR     = r"C:\Matlama"
-MODEL_DIR    = os.path.join(BASE_DIR, "model")
-LOG_DIR      = os.path.join(BASE_DIR, "logs")
-API_KEY      = "Yu4minawena!"
+BASE_DIR    = r"C:\Matlama"
+MODEL_DIR   = os.path.join(BASE_DIR, "model")
+LOG_DIR     = os.path.join(BASE_DIR, "logs")
 
-# MBV3 model paths
-MODEL_PATH   = os.path.join(MODEL_DIR, "rf_model.pkl")
-SCALER_PATH  = os.path.join(MODEL_DIR, "scaler.pkl")
-
-# MatlamaQuant model paths
+MODEL_PATH        = os.path.join(MODEL_DIR, "rf_model.pkl")
+SCALER_PATH       = os.path.join(MODEL_DIR, "scaler.pkl")
 QUANT_MODEL_PATH  = os.path.join(MODEL_DIR, "quant_model.pkl")
 QUANT_SCALER_PATH = os.path.join(MODEL_DIR, "quant_scaler.pkl")
 
@@ -56,10 +54,20 @@ app = Flask(__name__)
 # Model store — lazy load with hot reload
 # ---------------------------------------------------------------------------
 _models = {
-    "mbv3":  {"model": None, "scaler": None, "mtime": None,
-               "path": MODEL_PATH,  "scaler_path": SCALER_PATH},
-    "quant": {"model": None, "scaler": None, "mtime": None,
-               "path": QUANT_MODEL_PATH, "scaler_path": QUANT_SCALER_PATH},
+    "mbv3": {
+        "model":       None,
+        "scaler":      None,
+        "mtime":       None,
+        "path":        MODEL_PATH,
+        "scaler_path": SCALER_PATH,
+    },
+    "quant": {
+        "model":       None,
+        "scaler":      None,
+        "mtime":       None,
+        "path":        QUANT_MODEL_PATH,
+        "scaler_path": QUANT_SCALER_PATH,
+    },
 }
 
 
@@ -71,7 +79,7 @@ def load_model(key):
     if store["model"] is not None and mtime == store["mtime"]:
         return True
     try:
-        store["model"]  = joblib.load(store["path"])
+        store["model"] = joblib.load(store["path"])
         if os.path.exists(store["scaler_path"]):
             store["scaler"] = joblib.load(store["scaler_path"])
         store["mtime"] = mtime
@@ -83,11 +91,6 @@ def load_model(key):
         return False
 
 
-def check_api_key():
-    key = request.headers.get("X-API-Key") or request.args.get("api_key")
-    return key == API_KEY
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -96,10 +99,10 @@ def health():
     mbv3_ok  = load_model("mbv3")
     quant_ok = load_model("quant")
     return jsonify({
-        "status": "ok",
+        "status":             "ok",
         "mbv3_model_loaded":  mbv3_ok,
         "quant_model_loaded": quant_ok,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp":          datetime.now(timezone.utc).isoformat(),
     })
 
 
@@ -111,9 +114,14 @@ def get_threshold():
     thresh = DEFAULT_THRESHOLD
     if ok and hasattr(_models["mbv3"]["model"], "matlama_threshold_"):
         thresh = _models["mbv3"]["model"].matlama_threshold_
-    logger.info("MBV3 threshold → %s for %s: %.3f", ea, symbol, thresh)
-    return jsonify({"ea": ea, "symbol": symbol, "threshold": thresh,
-                    "model_loaded": ok})
+    logger.info("MBV3 threshold request | ea=%s symbol=%s threshold=%.3f",
+                ea, symbol, thresh)
+    return jsonify({
+        "ea":           ea,
+        "symbol":       symbol,
+        "threshold":    thresh,
+        "model_loaded": ok,
+    })
 
 
 @app.route("/quant_threshold", methods=["GET"])
@@ -121,22 +129,21 @@ def get_quant_threshold():
     symbol = request.args.get("symbol", "GOLD")
     ok     = load_model("quant")
     thresh = QUANT_DEFAULT_THRESHOLD
-    if ok and hasattr(_models["quant"]["model"], "matlama_threshold_"):
-        thresh = _models["quant"]["model"].matlama_threshold_
-    acc = None
-    wr  = None
+    acc    = None
+    wr     = None
     if ok:
-        m = _models["quant"]["model"]
-        acc = getattr(m, "matlama_accuracy_",  None)
-        wr  = getattr(m, "matlama_win_rate_",  None)
-    logger.info("Quant threshold → %s: %.3f", symbol, thresh)
+        m      = _models["quant"]["model"]
+        thresh = getattr(m, "matlama_threshold_", QUANT_DEFAULT_THRESHOLD)
+        acc    = getattr(m, "matlama_accuracy_",  None)
+        wr     = getattr(m, "matlama_win_rate_",  None)
+    logger.info("Quant threshold request | symbol=%s threshold=%.3f", symbol, thresh)
     return jsonify({
-        "ea": "MatlamaQuant",
-        "symbol": symbol,
-        "threshold": thresh,
+        "ea":           "MatlamaQuant",
+        "symbol":       symbol,
+        "threshold":    thresh,
         "model_loaded": ok,
-        "accuracy": acc,
-        "win_rate": wr,
+        "accuracy":     acc,
+        "win_rate":     wr,
     })
 
 
@@ -148,7 +155,7 @@ def predict():
     data     = request.get_json(force=True, silent=True) or {}
     features = data.get("features")
     if not features:
-        return jsonify({"error": "missing features"}), 400
+        return jsonify({"error": "missing features array"}), 400
     try:
         X = np.array(features).reshape(1, -1)
         if _models["mbv3"]["scaler"] is not None:
@@ -156,6 +163,7 @@ def predict():
         proba      = _models["mbv3"]["model"].predict_proba(X)[0]
         confidence = float(np.max(proba))
         prediction = int(_models["mbv3"]["model"].predict(X)[0])
+        logger.info("MBV3 predict | pred=%d conf=%.3f", prediction, confidence)
         return jsonify({"prediction": prediction, "confidence": confidence})
     except Exception as e:
         logger.error("MBV3 predict error: %s", e)
@@ -170,7 +178,7 @@ def quant_predict():
     data     = request.get_json(force=True, silent=True) or {}
     features = data.get("features")
     if not features:
-        return jsonify({"error": "missing features"}), 400
+        return jsonify({"error": "missing features array"}), 400
     try:
         X = np.array(features).reshape(1, -1)
         if _models["quant"]["scaler"] is not None:
@@ -178,6 +186,7 @@ def quant_predict():
         proba      = _models["quant"]["model"].predict_proba(X)[0]
         confidence = float(np.max(proba))
         prediction = int(_models["quant"]["model"].predict(X)[0])
+        logger.info("Quant predict | pred=%d conf=%.3f", prediction, confidence)
         return jsonify({"prediction": prediction, "confidence": confidence})
     except Exception as e:
         logger.error("Quant predict error: %s", e)
@@ -185,10 +194,11 @@ def quant_predict():
 
 
 # ---------------------------------------------------------------------------
-# Start
+# Start — Waitress production WSGI server
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting Matlama Threshold Server v2 on http://localhost:6000")
+    logger.info("Starting Matlama Threshold Server v3 (Waitress) on localhost:6000")
     load_model("mbv3")
     load_model("quant")
-    app.run(host="127.0.0.1", port=6000, debug=False)
+    logger.info("Models loaded. Serving...")
+    serve(app, host="127.0.0.1", port=6000, threads=4)
