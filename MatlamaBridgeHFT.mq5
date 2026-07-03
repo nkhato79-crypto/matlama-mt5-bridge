@@ -1,77 +1,428 @@
 //+------------------------------------------------------------------+
-//|                                              MatlamaBridge.mq5   |
-//|                                          Matlama Tech © 2026     |
-//|                     Self-contained 5-layer signal engine         |
+//|                                        MatlamaBridgeHFT.mq5      |
+//|                                      Matlama Tech © 2026         |
+//|              HFT Manipulation Detector — Reactive Entry          |
+//|         Detects stop hunts, liquidity grabs, and momentum        |
+//|         bursts AT Fibonacci levels. Enters confirmed moves.      |
 //+------------------------------------------------------------------+
 #property copyright "Matlama Tech 2026"
-#property version   "3.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 //--- Input Parameters
-input string   EA_Name       = "MatlamaBridge v3";
-input double   LotSize       = 0.01;
-input int      SL_Pips       = 50;
-input int      TP_Pips       = 100;
-input int      Slippage      = 10;
-input int      PollSeconds   = 30;
-input int      MagicNumber   = 20260101;
-input bool     AutoTrade     = false;
-input double   MaxDailyLoss  = 100.0;
+input string   EA_Name         = "MatlamaBridgeHFT v2";
+input double   LotSize         = 0.01;
+input int      MagicNumber     = 20260102;
+input int      SL_Pips         = 30;           // tighter SL for HFT
+input int      TP_Pips         = 60;           // 1:2 RR minimum
+input int      PollSeconds     = 5;            // fast poll for HFT
+input bool     AutoTrade       = true;
+input double   MaxDailyLoss    = 100.0;
+input int      MaxTradesPerDay = 5;            // quality over quantity
 
-// --- COT & Gamma (update weekly from CFTC report)
-input string   COT_Bias      = "BUY";   // BUY, SELL, or NEUTRAL
-input double   DealerGamma   = -0.5;    // Negative = amplifies moves
-input int      ScoreThreshold = 3;      // Minimum score to trade (out of 5)
+//--- HFT Detection Settings
+input double   SpikeThreshold  = 20.0;        // pips in 1 minute to detect spike
+input double   ReverseBuffer   = 5.0;         // pips back through level for manipulation confirm
+input int      LookbackCandles = 10;          // candles to find liquidity pools
+input double   MinSpread       = 0.5;         // minimum spread (not trading during crazy spread)
+input double   MaxSpread       = 15.0;        // maximum spread allowed
+
+//--- Fibonacci Settings
+input int      SwingLookback   = 30;          // candles for swing detection
+input double   FibProximity    = 10.0;        // pips from Fib to consider proximity
+
+//--- Session Filter
+input bool     LondonSession   = true;        // trade London session
+input bool     NewYorkSession  = true;        // trade NY session
+input bool     AsiaSession     = false;       // skip Asia (low liquidity)
 
 //--- Global Variables
 CTrade   trade;
-datetime LastCheck        = 0;
-string   LastSignal       = "";
-double   dailyStartBalance;
+datetime LastCheck       = 0;
 datetime dailyResetTime;
+double   dailyStartBalance;
+int      dailyTradeCount = 0;
 int      atrHandle;
+int      rsiHandle;
+ulong    lastLoggedTicket = 0;
 
+//--- Fibonacci levels
+double   SwingHigh    = 0;
+double   SwingLow     = 0;
+double   Fib382       = 0;
+double   Fib500       = 0;
+double   Fib618       = 0;
+double   Fib786       = 0;
+datetime LastFibCalc  = 0;
+
+//--- Manipulation tracking
+double   LastSpikeHigh  = 0;
+double   LastSpikeLow   = 0;
+datetime LastSpikeTime  = 0;
+string   CSV_PATH       = "hft_trades.csv";
+
+//+------------------------------------------------------------------+
+//| Session filter                                                    |
+//+------------------------------------------------------------------+
+bool IsValidSession()
+{
+   MqlDateTime now;
+   TimeToStruct(TimeGMT(), now);
+   int hour = now.hour;
+
+   if(LondonSession  && hour >= 7  && hour < 12)  return true;
+   if(NewYorkSession && hour >= 12 && hour < 20)  return true;
+   if(AsiaSession    && (hour >= 0  && hour < 7))  return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Fibonacci levels                                        |
+//+------------------------------------------------------------------+
+void CalculateFibLevels()
+{
+   if((TimeCurrent() - LastFibCalc) < 3600 && LastFibCalc != 0) return;
+
+   double highs[], lows[];
+   ArraySetAsSeries(highs, true);
+   ArraySetAsSeries(lows,  true);
+
+   if(CopyHigh(_Symbol, PERIOD_H1, 0, SwingLookback, highs) < SwingLookback) return;
+   if(CopyLow(_Symbol,  PERIOD_H1, 0, SwingLookback, lows)  < SwingLookback) return;
+
+   SwingHigh = highs[ArrayMaximum(highs, 0, SwingLookback)];
+   SwingLow  = lows[ArrayMinimum(lows,   0, SwingLookback)];
+
+   double range = SwingHigh - SwingLow;
+   if(range <= 0) return;
+
+   Fib382 = SwingHigh - (range * 0.382);
+   Fib500 = SwingHigh - (range * 0.500);
+   Fib618 = SwingHigh - (range * 0.618);
+   Fib786 = SwingHigh - (range * 0.786);
+
+   LastFibCalc = TimeCurrent();
+   Print("HFT Fib levels | H:", SwingHigh, " L:", SwingLow,
+         " | 38.2:", Fib382, " 50:", Fib500,
+         " 61.8:", Fib618, " 78.6:", Fib786);
+}
+
+//+------------------------------------------------------------------+
+//| Check if price is near a Fibonacci level                         |
+//+------------------------------------------------------------------+
+bool NearFibLevel(double price, double &nearestFib)
+{
+   if(Fib618 == 0) return false;
+
+   double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double levels[4] = {Fib382, Fib500, Fib618, Fib786};
+   double minDist = FibProximity * pip + 1;
+
+   for(int i = 0; i < 4; i++)
+   {
+      double dist = MathAbs(price - levels[i]) / pip;
+      if(dist < minDist)
+      {
+         minDist    = dist;
+         nearestFib = levels[i];
+      }
+   }
+   return (minDist < FibProximity);
+}
+
+//+------------------------------------------------------------------+
+//| Detect stop hunt / liquidity grab                                |
+//| A stop hunt: price spikes through a swing high/low then reverses |
+//+------------------------------------------------------------------+
+bool DetectStopHunt(string &direction)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, PERIOD_M1, 0, LookbackCandles + 3, rates) < LookbackCandles + 3)
+      return false;
+
+   double pip = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+
+   // Find recent swing high and low from lookback candles
+   double swingH = rates[2].high;
+   double swingL = rates[2].low;
+   for(int i = 2; i <= LookbackCandles; i++)
+   {
+      if(rates[i].high > swingH) swingH = rates[i].high;
+      if(rates[i].low  < swingL) swingL = rates[i].low;
+   }
+
+   double lastHigh  = rates[1].high;
+   double lastLow   = rates[1].low;
+   double lastClose = rates[1].close;
+   double lastOpen  = rates[1].open;
+
+   // BULLISH stop hunt: price wicked below swing low then closed back above
+   // Indicates market makers grabbed liquidity below, now reversing UP
+   if(lastLow < swingL &&
+      lastClose > swingL &&
+      lastClose > lastOpen &&
+      (swingL - lastLow) / pip >= ReverseBuffer)
+   {
+      direction = "BUY";
+      Print("HFT | BULLISH stop hunt detected | Swept low:", swingL,
+            " Wick to:", lastLow, " Close:", lastClose);
+      return true;
+   }
+
+   // BEARISH stop hunt: price wicked above swing high then closed back below
+   // Indicates market makers grabbed liquidity above, now reversing DOWN
+   if(lastHigh > swingH &&
+      lastClose < swingH &&
+      lastClose < lastOpen &&
+      (lastHigh - swingH) / pip >= ReverseBuffer)
+   {
+      direction = "SELL";
+      Print("HFT | BEARISH stop hunt detected | Swept high:", swingH,
+            " Wick to:", lastHigh, " Close:", lastClose);
+      return true;
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Detect momentum burst — price moving fast in one direction        |
+//+------------------------------------------------------------------+
+bool DetectMomentumBurst(string &direction)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, PERIOD_M1, 0, 5, rates) < 5) return false;
+
+   double pip  = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double move = (rates[0].close - rates[2].close) / pip;
+
+   // Bullish burst — moved up fast in last 3 minutes
+   if(move >= SpikeThreshold)
+   {
+      // Confirm with volume
+      long volBuf[];
+      ArraySetAsSeries(volBuf, true);
+      if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 10, volBuf) < 10) return false;
+      double avgVol = 0;
+      for(int i = 3; i < 10; i++) avgVol += (double)volBuf[i];
+      avgVol /= 7;
+      if((double)volBuf[0] >= avgVol * 1.5)
+      {
+         direction = "BUY";
+         Print("HFT | Bullish momentum burst | Move:", DoubleToString(move, 1),
+               " pips | Vol surge: ", DoubleToString((double)volBuf[0]/avgVol, 1), "x");
+         return true;
+      }
+   }
+
+   // Bearish burst
+   if(move <= -SpikeThreshold)
+   {
+      long volBuf[];
+      ArraySetAsSeries(volBuf, true);
+      if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 10, volBuf) < 10) return false;
+      double avgVol = 0;
+      for(int i = 3; i < 10; i++) avgVol += (double)volBuf[i];
+      avgVol /= 7;
+      if((double)volBuf[0] >= avgVol * 1.5)
+      {
+         direction = "SELL";
+         Print("HFT | Bearish momentum burst | Move:", DoubleToString(move, 1),
+               " pips | Vol surge: ", DoubleToString((double)volBuf[0]/avgVol, 1), "x");
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Spread check                                                      |
+//+------------------------------------------------------------------+
+bool SpreadOk()
+{
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double spread = (ask - bid) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+   if(spread < MinSpread || spread > MaxSpread)
+   {
+      Print("HFT | Spread out of range: ", DoubleToString(spread, 1), " pips");
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| RSI confirmation                                                  |
+//+------------------------------------------------------------------+
+bool RSIConfirms(string direction)
+{
+   double rsiBuf[];
+   ArraySetAsSeries(rsiBuf, true);
+   if(CopyBuffer(rsiHandle, 0, 0, 3, rsiBuf) < 3) return false;
+   double rsi = rsiBuf[0];
+   if(direction == "BUY")  return rsi < 65;  // not overbought
+   if(direction == "SELL") return rsi > 35;  // not oversold
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Initialize CSV                                                    |
+//+------------------------------------------------------------------+
+void InitCSV()
+{
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE)
+   {
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      if(handle != INVALID_HANDLE)
+      {
+         FileWrite(handle,
+            "ticket","symbol","type","open_time","close_time",
+            "open_price","close_price","volume","profit",
+            "swap","commission","duration_min",
+            "buy_score","sell_score","signal_score");
+         FileClose(handle);
+         Print("HFT CSV initialized");
+      }
+   }
+   else FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
+//| Log closed trades                                                 |
+//+------------------------------------------------------------------+
+void LogClosedTrades()
+{
+   HistorySelect(TimeCurrent() - 86400 * 7, TimeCurrent());
+   int total = HistoryDealsTotal();
+   if(total == 0) return;
+
+   bool hasNew = false;
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket <= lastLoggedTicket) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (ulong)MagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      hasNew = true;
+      break;
+   }
+   if(!hasNew) return;
+
+   int handle = FileOpen(CSV_PATH,
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE) return;
+   FileSeek(handle, 0, SEEK_END);
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket <= lastLoggedTicket) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (ulong)MagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+
+      long     dtype      = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      string   typeStr    = (dtype == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+      datetime closeTime  = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      double   closePrice = HistoryDealGetDouble(ticket, DEAL_PRICE);
+      double   volume     = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+      double   profit     = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      double   swap       = HistoryDealGetDouble(ticket, DEAL_SWAP);
+      double   comm       = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+
+      double   openPrice  = 0;
+      datetime entryTime  = 0;
+      ulong posId = (ulong)HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      for(int j = 0; j < total; j++)
+      {
+         ulong t2 = HistoryDealGetTicket(j);
+         if((ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID) == posId &&
+            HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         {
+            openPrice = HistoryDealGetDouble(t2, DEAL_PRICE);
+            entryTime = (datetime)HistoryDealGetInteger(t2, DEAL_TIME);
+            break;
+         }
+      }
+
+      int durationMin = (int)((closeTime - entryTime) / 60);
+
+      FileWrite(handle,
+         (string)ticket, _Symbol, typeStr,
+         TimeToString(entryTime,   TIME_DATE|TIME_MINUTES),
+         TimeToString(closeTime,   TIME_DATE|TIME_MINUTES),
+         DoubleToString(openPrice,  _Digits),
+         DoubleToString(closePrice, _Digits),
+         DoubleToString(volume, 2),
+         DoubleToString(profit, 2),
+         DoubleToString(swap,   2),
+         DoubleToString(comm,   2),
+         (string)durationMin,
+         "3", "3", "3"   // HFT uses 3-layer confirmation
+      );
+
+      lastLoggedTicket = ticket;
+      Print("HFT trade logged | Ticket:", ticket, " Profit:", profit);
+   }
+   FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
+//| OnInit                                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   atrHandle = iATR(_Symbol, PERIOD_H1, 14);
-   if(atrHandle == INVALID_HANDLE)
+   atrHandle = iATR(_Symbol, PERIOD_M5, 14);
+   rsiHandle = iRSI(_Symbol, PERIOD_M5, 14, PRICE_CLOSE);
+
+   if(atrHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE)
    {
-      Print("ERROR: ATR handle failed");
+      Print("ERROR: Indicator handle failed");
       return(INIT_FAILED);
    }
 
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(Slippage);
+   trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyResetTime    = TimeCurrent();
+   dailyTradeCount   = 0;
+
+   CalculateFibLevels();
+   InitCSV();
 
    Print("=== ", EA_Name, " initialized ===");
-   Print("Symbol: ",     _Symbol);
-   Print("AutoTrade: ",  AutoTrade ? "ENABLED" : "DISABLED");
-   Print("COT Bias: ",   COT_Bias);
-   Print("Threshold: ",  ScoreThreshold, "/5");
-   Print("Lot Size: ",   LotSize);
+   Print("Strategy: Stop Hunt + Momentum Burst at Fibonacci levels");
+   Print("Max trades/day: ", MaxTradesPerDay);
+   Print("Spike threshold: ", SpikeThreshold, " pips");
 
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
+//| OnDeinit                                                          |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(atrHandle != INVALID_HANDLE)
-      IndicatorRelease(atrHandle);
+   if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+   if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
    Print(EA_Name, " stopped. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
+//| OnTick                                                            |
+//+------------------------------------------------------------------+
 void OnTick()
 {
-   // Reset daily balance at midnight
+   // Daily reset
    MqlDateTime now, reset;
    TimeToStruct(TimeCurrent(), now);
    TimeToStruct(dailyResetTime, reset);
@@ -79,213 +430,111 @@ void OnTick()
    {
       dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       dailyResetTime    = TimeCurrent();
-      Print("Daily balance reset: ", dailyStartBalance);
+      dailyTradeCount   = 0;
+      Print("HFT daily reset | Balance:", dailyStartBalance);
    }
 
    // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
    {
-      Print("Daily loss limit reached. Halting.");
+      Print("HFT | Daily loss limit reached. Halting.");
       return;
    }
+
+   // Daily trade limit
+   if(dailyTradeCount >= MaxTradesPerDay)
+      return;
+
+   // Log closed trades
+   LogClosedTrades();
 
    // Poll throttle
-   if((TimeCurrent() - LastCheck) < PollSeconds)
-      return;
+   if((TimeCurrent() - LastCheck) < PollSeconds) return;
    LastCheck = TimeCurrent();
 
-   // ── Run signal engine ──────────────────────────────────────────
-   int buyScore  = EvaluateSignal("BUY");
-   int sellScore = EvaluateSignal("SELL");
+   // Session filter
+   if(!IsValidSession()) return;
 
-   string action   = "HOLD";
-   int    score    = 0;
+   // Spread check
+   if(!SpreadOk()) return;
 
-   if(buyScore >= sellScore && buyScore >= ScoreThreshold)
-   {
-      action = "BUY";
-      score  = buyScore;
-   }
-   else if(sellScore > buyScore && sellScore >= ScoreThreshold)
-   {
-      action = "SELL";
-      score  = sellScore;
-   }
+   // Recalculate Fibonacci every hour
+   CalculateFibLevels();
 
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   Print("Signal: ", action, " | BUY=", buyScore, "/5 | SELL=", sellScore,
-         "/5 | Gold: $", DoubleToString(price, 2));
+   if(!AutoTrade) return;
 
-   if(!AutoTrade || action == "HOLD")
-      return;
-
-   // Skip duplicate
-   if(action == LastSignal)
-      return;
-
-   // Check for existing position
+   // Skip if already in position
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetTicket(i) > 0 &&
          PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-      {
-         Print("Position already open. Skipping.");
          return;
+   }
+
+   double price      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double nearestFib = 0;
+   string direction  = "";
+   string signalType = "";
+
+   // Signal 1: Stop Hunt at Fibonacci level (highest quality)
+   if(DetectStopHunt(direction))
+   {
+      if(NearFibLevel(price, nearestFib))
+      {
+         if(RSIConfirms(direction))
+            signalType = "STOP_HUNT";
       }
    }
 
-   // Execute trade
+   // Signal 2: Momentum Burst through Fibonacci level
+   if(signalType == "" && DetectMomentumBurst(direction))
+   {
+      if(NearFibLevel(price, nearestFib))
+      {
+         if(RSIConfirms(direction))
+            signalType = "MOMENTUM";
+      }
+   }
+
+   if(signalType == "") return;
+
+   // === SIGNAL CONFIRMED — ENTER TRADE ===
+   Print("HFT | Signal: ", signalType, " | Direction: ", direction,
+         " | Fib: ", nearestFib, " | Price: ", price);
+
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double pipSize = point * 10;
    double sl_dist = SL_Pips * pipSize;
    double tp_dist = TP_Pips * pipSize;
    bool   success = false;
 
-   if(action == "BUY")
+   if(direction == "BUY")
    {
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "MB_BUY");
+      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "HFT_BUY");
       if(success)
-         Print("BUY executed | Ask:", ask, " SL:", sl, " TP:", tp);
-      else
-         Print("BUY failed: ", trade.ResultRetcodeDescription());
+      {
+         dailyTradeCount++;
+         Print("HFT BUY | Ask:", ask, " SL:", sl, " TP:", tp,
+               " | Type:", signalType, " Fib:", nearestFib);
+      }
+      else Print("HFT BUY failed: ", trade.ResultRetcodeDescription());
    }
-   else if(action == "SELL")
+   else if(direction == "SELL")
    {
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "MB_SELL");
+      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "HFT_SELL");
       if(success)
-         Print("SELL executed | Bid:", bid, " SL:", sl, " TP:", tp);
-      else
-         Print("SELL failed: ", trade.ResultRetcodeDescription());
-   }
-
-   if(success) LastSignal = action;
-}
-
-//+------------------------------------------------------------------+
-//| Evaluate signal score for a given direction (0-5)                |
-//+------------------------------------------------------------------+
-int EvaluateSignal(string direction)
-{
-   int score = 0;
-
-   // Layer 1: COT/CFTC Bias
-   if(COT_Bias == "NEUTRAL") score++;
-   else if(COT_Bias == direction) score++;
-
-   // Layer 2: Dealer Gamma
-   if(direction == "BUY"  && DealerGamma <= 0) score++;
-   if(direction == "SELL" && DealerGamma >= 0) score++;
-
-   // Layer 3: Market Structure (H1 - Higher Highs/Lower Lows)
-   if(CheckStructure(direction)) score++;
-
-   // Layer 4: Price Action (H1 - Momentum candle)
-   if(CheckPriceAction(direction)) score++;
-
-   // Layer 5: Chart Patterns (H4 - Double top/bottom)
-   if(CheckPatterns(direction)) score++;
-
-   return score;
-}
-
-//+------------------------------------------------------------------+
-//| Layer 3: Market Structure                                         |
-//+------------------------------------------------------------------+
-bool CheckStructure(string direction)
-{
-   double highs[], lows[];
-   ArraySetAsSeries(highs, true);
-   ArraySetAsSeries(lows,  true);
-
-   if(CopyHigh(_Symbol, PERIOD_H1, 0, 20, highs) < 20) return false;
-   if(CopyLow(_Symbol,  PERIOD_H1, 0, 20, lows)  < 20) return false;
-
-   // Recent 5 bars vs prior 5 bars
-   double recentHigh = highs[0];
-   double recentLow  = lows[0];
-   double priorHigh  = highs[5];
-   double priorLow   = lows[5];
-
-   for(int i = 1; i < 5; i++)
-   {
-      if(highs[i] > recentHigh) recentHigh = highs[i];
-      if(lows[i]  < recentLow)  recentLow  = lows[i];
-   }
-   for(int i = 5; i < 10; i++)
-   {
-      if(highs[i] > priorHigh) priorHigh = highs[i];
-      if(lows[i]  < priorLow)  priorLow  = lows[i];
-   }
-
-   if(direction == "BUY")
-      return (recentHigh > priorHigh && recentLow > priorLow);
-   else
-      return (recentHigh < priorHigh && recentLow < priorLow);
-}
-
-//+------------------------------------------------------------------+
-//| Layer 4: Price Action                                             |
-//+------------------------------------------------------------------+
-bool CheckPriceAction(string direction)
-{
-   MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, PERIOD_H1, 0, 3, rates) < 3) return false;
-
-   double open  = rates[0].open;
-   double close = rates[0].close;
-   double high  = rates[0].high;
-   double low   = rates[0].low;
-   double body  = MathAbs(close - open);
-
-   if(body == 0) return false;
-
-   double wickUp   = high  - MathMax(close, open);
-   double wickDown = MathMin(close, open) - low;
-
-   if(direction == "BUY")
-      return (close > open && wickDown < body * 0.5);
-   else
-      return (close < open && wickUp   < body * 0.5);
-}
-
-//+------------------------------------------------------------------+
-//| Layer 5: Chart Patterns (Double top/bottom on H4)                |
-//+------------------------------------------------------------------+
-bool CheckPatterns(string direction)
-{
-   double highs[], lows[];
-   ArraySetAsSeries(highs, true);
-   ArraySetAsSeries(lows,  true);
-
-   if(CopyHigh(_Symbol, PERIOD_H4, 0, 30, highs) < 30) return false;
-   if(CopyLow(_Symbol,  PERIOD_H4, 0, 30, lows)  < 30) return false;
-
-   if(direction == "BUY")
-   {
-      // Double bottom — two similar lows
-      double low1 = lows[10];
-      double low2 = lows[20];
-      for(int i = 10; i < 20; i++) if(lows[i] < low1) low1 = lows[i];
-      for(int i = 20; i < 30; i++) if(lows[i] < low2) low2 = lows[i];
-      if(low1 == 0) return false;
-      return (MathAbs(low1 - low2) / low1 < 0.005);
-   }
-   else
-   {
-      // Double top — two similar highs
-      double high1 = highs[10];
-      double high2 = highs[20];
-      for(int i = 10; i < 20; i++) if(highs[i] > high1) high1 = highs[i];
-      for(int i = 20; i < 30; i++) if(highs[i] > high2) high2 = highs[i];
-      if(high1 == 0) return false;
-      return (MathAbs(high1 - high2) / high1 < 0.005);
+      {
+         dailyTradeCount++;
+         Print("HFT SELL | Bid:", bid, " SL:", sl, " TP:", tp,
+               " | Type:", signalType, " Fib:", nearestFib);
+      }
+      else Print("HFT SELL failed: ", trade.ResultRetcodeDescription());
    }
 }
