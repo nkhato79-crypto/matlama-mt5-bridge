@@ -1,4 +1,3 @@
-
 //+------------------------------------------------------------------+
 //|                                            MatlamaQuant.mq5      |
 //|                                        Matlama Tech © 2026       |
@@ -551,13 +550,16 @@ int OnInit()
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",       _Symbol);
    Print("AutoTrade: ",    AutoTrade ? "ENABLED" : "DISABLED");
-   Print("Magic: ",        MagicNumber
-Print("Strategy: Fibonacci Reactive | 5-Layer Confirmation");
+   Print("Magic: ",        MagicNumber);
+   Print("Strategy: Fibonacci Reactive | 5-Layer Confirmation");
    Print("CSV: quant_trades.csv");
 
    return(INIT_SUCCEEDED);
 }
 
+//+------------------------------------------------------------------+
+//| OnDeinit                                                         |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    if(rsiHandle  != INVALID_HANDLE) IndicatorRelease(rsiHandle);
@@ -565,8 +567,12 @@ void OnDeinit(const int reason)
    Print(EA_Name, " stopped. Reason: ", reason);
 }
 
+//+------------------------------------------------------------------+
+//| OnTick                                                           |
+//+------------------------------------------------------------------+
 void OnTick()
 {
+   // Daily reset
    MqlDateTime now, reset;
    TimeToStruct(TimeCurrent(), now);
    TimeToStruct(dailyResetTime, reset);
@@ -577,6 +583,7 @@ void OnTick()
       Print("Daily balance reset: ", dailyStartBalance);
    }
 
+   // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
    {
@@ -584,16 +591,22 @@ void OnTick()
       return;
    }
 
+   // Log closed trades
    LogClosedTrades();
+
+   // Check time exit on open positions
    CheckTimeExit();
 
+   // Poll interval
    if((TimeCurrent() - LastCheck) < PollSeconds) return;
    LastCheck = TimeCurrent();
 
+   // Recalculate Fibonacci levels every 4 hours
    CalculateFibLevels();
 
    if(!AutoTrade) return;
 
+   // Skip if already in a position
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetTicket(i) > 0 &&
@@ -608,24 +621,51 @@ void OnTick()
    double nearestFib = 0;
    string direction  = "";
 
+   // === 5-LAYER SIGNAL EVALUATION ===
+
+   // Layer 1 — Fibonacci Proximity
    if(!CheckFibProximity(price, nearestFib, direction))
-   { Print("Signal: HOLD | Layer 1 failed"); return; }
+   {
+      Print("Signal: HOLD | Layer 1 failed — not near Fib level");
+      return;
+   }
 
+   // Layer 2 — Velocity
    if(!CheckVelocity(direction))
-   { Print("Signal: HOLD | Layer 2 failed"); return; }
+   {
+      Print("Signal: HOLD | Layer 2 failed — insufficient velocity");
+      return;
+   }
 
+   // Layer 3 — Volume Surge
    if(!CheckVolumeSurge())
-   { Print("Signal: HOLD | Layer 3 failed"); return; }
+   {
+      Print("Signal: HOLD | Layer 3 failed — no volume surge");
+      return;
+   }
 
+   // Layer 4 — Fibonacci Break and Close
    if(!CheckFibBreak(nearestFib, direction))
-   { Print("Signal: HOLD | Layer 4 failed"); return; }
+   {
+      Print("Signal: HOLD | Layer 4 failed — no confirmed Fib break");
+      return;
+   }
 
+   // Layer 5 — Momentum Acceleration
    if(!CheckMomentumAcceleration(direction))
-   { Print("Signal: HOLD | Layer 5 failed"); return; }
+   {
+      Print("Signal: HOLD | Layer 5 failed — momentum not accelerating");
+      return;
+   }
 
+   // Dynamic spread check
    if(!CheckDynamicSpread(nearestFib))
-   { Print("Signal: HOLD | Spread too wide"); return; }
+   {
+      Print("Signal: HOLD | Spread too wide relative to Fib distance");
+      return;
+   }
 
+   // === ALL 5 LAYERS CONFIRMED — ENTER TRADE ===
    Print("=== SIGNAL CONFIRMED | All 5 layers passed | Direction: ", direction, " ===");
 
    double sl, tp1, tp2, tp3;
@@ -640,9 +680,12 @@ void OnTick()
       tp1 = NormalizeDouble(tp1, _Digits);
       success = trade.Buy(LotSize, _Symbol, 0, sl, tp1, "MQ_BUY");
       if(success)
-         Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1, " | Fib:", nearestFib);
-      else
-         Print("BUY failed: ", trade.ResultRetcodeDescription());
+      {
+         Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1,
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib);
+         EntryTime = TimeCurrent();
+      }
+      else Print("BUY failed: ", trade.ResultRetcodeDescription());
    }
    else if(direction == "SELL")
    {
@@ -651,8 +694,11 @@ void OnTick()
       tp1 = NormalizeDouble(tp1, _Digits);
       success = trade.Sell(LotSize, _Symbol, 0, sl, tp1, "MQ_SELL");
       if(success)
-         Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1, " | Fib:", nearestFib);
-      else
-         Print("SELL failed: ", trade.ResultRetcodeDescription());
+      {
+         Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1,
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib);
+         EntryTime = TimeCurrent();
+      }
+      else Print("SELL failed: ", trade.ResultRetcodeDescription());
    }
 }
