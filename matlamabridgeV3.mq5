@@ -8,6 +8,7 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "OrchestratorClient.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaBridge v5";
@@ -43,6 +44,14 @@ input int      MACD_Signal    = 9;
 input int      ADX_Period     = 14;
 input int      ADX_MinLevel   = 25;
 
+//--- Orchestrator v2 Settings (full override — replaces 9-layer scoring)
+input string   ORCH_SERVER            = "http://127.0.0.1:7000/decision_v2";
+input string   ORCH_REPORT            = "http://127.0.0.1:7000/report_trade";
+input double   MaxSpreadPips          = 5.0;
+input bool     AllowNewsTrading       = false;
+input bool     AllowCrisisTrading     = false;
+input double   MaxAccountDrawdownPct  = 0.20;
+
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck        = 0;
@@ -53,6 +62,9 @@ int      atrHandle;
 int      rsiHandle;
 int      macdHandle;
 int      adxHandle;
+int      emaFastHandle;
+int      emaSlowHandle;
+string   LastRegime = "UNKNOWN";
 
 //--- CSV logging
 string   CSV_PATH = "hft_trades.csv";
@@ -172,6 +184,9 @@ void LogClosedTrades()
 
       lastLoggedTicket = ticket;
       Print("Trade logged | Ticket:", ticket, " Profit:", profit);
+
+      int winFlag = (profit > 0) ? 1 : 0;
+      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
    }
 
    FileClose(handle);
@@ -184,9 +199,12 @@ int OnInit()
    rsiHandle  = iRSI(_Symbol,  PERIOD_H1, RSI_Period, PRICE_CLOSE);
    macdHandle = iMACD(_Symbol, PERIOD_H1, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
    adxHandle  = iADX(_Symbol,  PERIOD_H1, ADX_Period);
+   emaFastHandle = iMA(_Symbol, PERIOD_H1, 12, 0, MODE_EMA, PRICE_CLOSE);
+   emaSlowHandle = iMA(_Symbol, PERIOD_H1, 26, 0, MODE_EMA, PRICE_CLOSE);
 
    if(atrHandle  == INVALID_HANDLE || rsiHandle == INVALID_HANDLE ||
-      macdHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE)
+      macdHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE ||
+      emaFastHandle == INVALID_HANDLE || emaSlowHandle == INVALID_HANDLE)
    {
       Print("ERROR: Indicator handle failed");
       return(INIT_FAILED);
@@ -218,6 +236,8 @@ void OnDeinit(const int reason)
    if(rsiHandle  != INVALID_HANDLE) IndicatorRelease(rsiHandle);
    if(macdHandle != INVALID_HANDLE) IndicatorRelease(macdHandle);
    if(adxHandle  != INVALID_HANDLE) IndicatorRelease(adxHandle);
+   if(emaFastHandle != INVALID_HANDLE) IndicatorRelease(emaFastHandle);
+   if(emaSlowHandle != INVALID_HANDLE) IndicatorRelease(emaSlowHandle);
    Print(EA_Name, " stopped. Reason: ", reason);
 }
 
@@ -246,21 +266,65 @@ void OnTick()
    if((TimeCurrent() - LastCheck) < PollSeconds) return;
    LastCheck = TimeCurrent();
 
-   int buyScore  = EvaluateSignal("BUY");
-   int sellScore = EvaluateSignal("SELL");
+   // === ORCHESTRATOR v2 — FULL OVERRIDE ===
+   // The 9-layer scoring model (EvaluateSignal) is bypassed; the orchestrator's
+   // decision (BUY/SELL/HOLD) is authoritative.
 
-   string action = "HOLD";
-   int    score  = 0;
+   double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask0   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spread = (ask0 - price) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
 
-   if(buyScore >= sellScore && buyScore >= ScoreThreshold)
-   { action = "BUY";  score = buyScore; }
-   else if(sellScore > buyScore && sellScore >= ScoreThreshold)
-   { action = "SELL"; score = sellScore; }
+   double atrBuf[]; ArraySetAsSeries(atrBuf, true);
+   double atr = 0;
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0)
+      atr = atrBuf[0] / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
 
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double adxBuf[]; ArraySetAsSeries(adxBuf, true);
+   double adx = 0;
+   if(CopyBuffer(adxHandle, 0, 0, 1, adxBuf) > 0) adx = adxBuf[0];
+
+   double rsiBuf[]; ArraySetAsSeries(rsiBuf, true);
+   double rsi = 50;
+   if(CopyBuffer(rsiHandle, 0, 0, 1, rsiBuf) > 0) rsi = rsiBuf[0];
+
+   double emaFastBuf[], emaSlowBuf[];
+   ArraySetAsSeries(emaFastBuf, true);
+   ArraySetAsSeries(emaSlowBuf, true);
+   double emaFast = 0, emaSlow = 0;
+   if(CopyBuffer(emaFastHandle, 0, 0, 1, emaFastBuf) > 0) emaFast = emaFastBuf[0];
+   if(CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlowBuf) > 0) emaSlow = emaSlowBuf[0];
+
+   double volatility = OrchCalcVolatility(_Symbol, PERIOD_H1, 20);
+   double momentum   = OrchCalcMomentum(_Symbol, PERIOD_H1, 10);
+
+   long volBuf2[]; ArraySetAsSeries(volBuf2, true);
+   double volume = 0;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 1, volBuf2) > 0) volume = (double)volBuf2[0];
+
+   int newsRisk = 0; // wire to a news calendar feed if/when available
+
+   string payload = OrchBuildPayload(price, spread, atr, adx, volatility, momentum,
+                                      volume, rsi, emaFast, emaSlow, newsRisk,
+                                      MaxSpreadPips, AllowNewsTrading, AllowCrisisTrading,
+                                      MaxAccountDrawdownPct);
+
+   OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
+
+   if(!dec.valid)
+   {
+      Print("ORCH | Unreachable — holding, no trade this tick");
+      return;
+   }
+
+   LastRegime = dec.regime;
+
+   string action = dec.decision; // "BUY" / "SELL" / "HOLD" — orchestrator is authoritative
+   int    score  = (int)MathRound(dec.confidence * 9); // scaled for CSV/print continuity
+
    Print("Signal: ", action,
-         " | BUY=",  buyScore,  "/9",
-         " | SELL=", sellScore, "/9",
+         " | ORCH confidence=",  DoubleToString(dec.confidence, 3),
+         " | Regime=", dec.regime,
+         " | Ensemble=", DoubleToString(dec.ensemble_score, 3),
          " | Gold: $", DoubleToString(price, 2));
 
    if(!AutoTrade || action == "HOLD") return;

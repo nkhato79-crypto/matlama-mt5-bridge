@@ -10,6 +10,7 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "OrchestratorClient.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaBridgeHFT v2";
@@ -33,6 +34,13 @@ input double   MaxSpread       = 15.0;        // maximum spread allowed
 input int      SwingLookback   = 30;          // candles for swing detection
 input double   FibProximity    = 10.0;        // pips from Fib to consider proximity
 
+//--- Orchestrator v2 Settings (full override — replaces stop-hunt/momentum gate)
+input string   ORCH_SERVER            = "http://127.0.0.1:7000/decision_v2";
+input string   ORCH_REPORT            = "http://127.0.0.1:7000/report_trade";
+input bool     AllowNewsTrading       = false;
+input bool     AllowCrisisTrading     = false;
+input double   MaxAccountDrawdownPct  = 0.20;
+
 //--- Session Filter
 input bool     LondonSession   = true;        // trade London session
 input bool     NewYorkSession  = true;        // trade NY session
@@ -46,7 +54,11 @@ double   dailyStartBalance;
 int      dailyTradeCount = 0;
 int      atrHandle;
 int      rsiHandle;
+int      adxHandle;
+int      emaFastHandle;
+int      emaSlowHandle;
 ulong    lastLoggedTicket = 0;
+string   LastRegime = "UNKNOWN";
 
 //--- Fibonacci levels
 double   SwingHigh    = 0;
@@ -370,6 +382,9 @@ void LogClosedTrades()
 
       lastLoggedTicket = ticket;
       Print("HFT trade logged | Ticket:", ticket, " Profit:", profit);
+
+      int winFlag = (profit > 0) ? 1 : 0;
+      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
    }
    FileClose(handle);
 }
@@ -381,8 +396,13 @@ int OnInit()
 {
    atrHandle = iATR(_Symbol, PERIOD_M5, 14);
    rsiHandle = iRSI(_Symbol, PERIOD_M5, 14, PRICE_CLOSE);
+   adxHandle = iADX(_Symbol, PERIOD_M5, 14);
+   emaFastHandle = iMA(_Symbol, PERIOD_M5, 12, 0, MODE_EMA, PRICE_CLOSE);
+   emaSlowHandle = iMA(_Symbol, PERIOD_M5, 26, 0, MODE_EMA, PRICE_CLOSE);
 
-   if(atrHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE)
+   if(atrHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE ||
+      adxHandle == INVALID_HANDLE || emaFastHandle == INVALID_HANDLE ||
+      emaSlowHandle == INVALID_HANDLE)
    {
       Print("ERROR: Indicator handle failed");
       return(INIT_FAILED);
@@ -414,6 +434,9 @@ void OnDeinit(const int reason)
 {
    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
    if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+   if(adxHandle != INVALID_HANDLE) IndicatorRelease(adxHandle);
+   if(emaFastHandle != INVALID_HANDLE) IndicatorRelease(emaFastHandle);
+   if(emaSlowHandle != INVALID_HANDLE) IndicatorRelease(emaSlowHandle);
    Print(EA_Name, " stopped. Reason: ", reason);
 }
 
@@ -472,36 +495,70 @@ void OnTick()
          return;
    }
 
-   double price      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   // === ORCHESTRATOR v2 — FULL OVERRIDE ===
+   // Stop-hunt/momentum-burst detection is bypassed; the orchestrator's
+   // decision (BUY/SELL/HOLD) is authoritative. Session filter and spread
+   // check above remain as hard structural gates, not signal logic.
+
+   double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask0   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spread = (ask0 - price) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+
+   double atrBuf[]; ArraySetAsSeries(atrBuf, true);
+   double atr = 0;
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0)
+      atr = atrBuf[0] / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+
+   double adxBuf[]; ArraySetAsSeries(adxBuf, true);
+   double adx = 0;
+   if(CopyBuffer(adxHandle, 0, 0, 1, adxBuf) > 0) adx = adxBuf[0];
+
+   double rsiBuf[]; ArraySetAsSeries(rsiBuf, true);
+   double rsi = 50;
+   if(CopyBuffer(rsiHandle, 0, 0, 1, rsiBuf) > 0) rsi = rsiBuf[0];
+
+   double emaFastBuf[], emaSlowBuf[];
+   ArraySetAsSeries(emaFastBuf, true);
+   ArraySetAsSeries(emaSlowBuf, true);
+   double emaFast = 0, emaSlow = 0;
+   if(CopyBuffer(emaFastHandle, 0, 0, 1, emaFastBuf) > 0) emaFast = emaFastBuf[0];
+   if(CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlowBuf) > 0) emaSlow = emaSlowBuf[0];
+
+   double volatility = OrchCalcVolatility(_Symbol, PERIOD_M5, 20);
+   double momentum   = OrchCalcMomentum(_Symbol, PERIOD_M1, 5);
+
+   long volBuf2[]; ArraySetAsSeries(volBuf2, true);
+   double volume = 0;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 1, volBuf2) > 0) volume = (double)volBuf2[0];
+
+   int newsRisk = 0; // wire to a news calendar feed if/when available
+
+   string payload = OrchBuildPayload(price, spread, atr, adx, volatility, momentum,
+                                      volume, rsi, emaFast, emaSlow, newsRisk,
+                                      MaxSpread, AllowNewsTrading, AllowCrisisTrading,
+                                      MaxAccountDrawdownPct);
+
+   OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
+
+   if(!dec.valid)
+   {
+      Print("HFT | ORCH unreachable — holding, no trade this tick");
+      return;
+   }
+
+   LastRegime = dec.regime;
+
+   if(dec.decision == "HOLD") return;
+
+   string direction  = dec.decision;      // "BUY" or "SELL" — orchestrator is authoritative
+   string signalType = "ORCHESTRATOR";
    double nearestFib = 0;
-   string direction  = "";
-   string signalType = "";
-
-   // Signal 1: Stop Hunt at Fibonacci level (highest quality)
-   if(DetectStopHunt(direction))
-   {
-      if(NearFibLevel(price, nearestFib))
-      {
-         if(RSIConfirms(direction))
-            signalType = "STOP_HUNT";
-      }
-   }
-
-   // Signal 2: Momentum Burst through Fibonacci level
-   if(signalType == "" && DetectMomentumBurst(direction))
-   {
-      if(NearFibLevel(price, nearestFib))
-      {
-         if(RSIConfirms(direction))
-            signalType = "MOMENTUM";
-      }
-   }
-
-   if(signalType == "") return;
+   NearFibLevel(price, nearestFib);       // best-effort reference level for logging only
 
    // === SIGNAL CONFIRMED — ENTER TRADE ===
    Print("HFT | Signal: ", signalType, " | Direction: ", direction,
-         " | Fib: ", nearestFib, " | Price: ", price);
+         " | Confidence: ", DoubleToString(dec.confidence, 3),
+         " | Regime: ", dec.regime, " | Price: ", price);
 
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double pipSize = point * 10;

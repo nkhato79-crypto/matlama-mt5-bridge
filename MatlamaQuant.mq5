@@ -9,6 +9,7 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "OrchestratorClient.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaQuant v1";
@@ -50,6 +51,14 @@ input int      MaxHoldHours    = 4;         // hard time exit
 input string   ML_SERVER       = "http://127.0.0.1:6000/quant_threshold";
 input double   DefaultThreshold = 0.60;     // higher threshold than MBV3
 
+//--- Orchestrator v2 Settings (full override — orchestrator decision replaces layer logic)
+input string   ORCH_SERVER            = "http://127.0.0.1:7000/decision_v2";
+input string   ORCH_REPORT            = "http://127.0.0.1:7000/report_trade";
+input double   MaxSpreadPips          = 5.0;
+input bool     AllowNewsTrading       = false;
+input bool     AllowCrisisTrading     = false;
+input double   MaxAccountDrawdownPct  = 0.20;
+
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck      = 0;
@@ -58,7 +67,12 @@ double   dailyStartBalance;
 datetime dailyResetTime;
 int      rsiHandle;
 int      macdHandle;
+int      adxHandle;
+int      atrHandle;
+int      emaFastHandle;
+int      emaSlowHandle;
 ulong    lastLoggedTicket = 0;
+string   LastRegime = "UNKNOWN";   // regime returned by orchestrator for the currently open position
 
 //--- Fibonacci Levels (calculated dynamically)
 double   SwingHigh      = 0;
@@ -497,6 +511,10 @@ void LogClosedTrades()
 
       lastLoggedTicket = ticket;
       Print("Quant trade logged | Ticket:", ticket, " Profit:", profit);
+
+      // Feed result back into the orchestrator's trade memory
+      int winFlag = (profit > 0) ? 1 : 0;
+      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
    }
 
    FileClose(handle);
@@ -529,10 +547,16 @@ void CheckTimeExit()
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   rsiHandle  = iRSI(_Symbol,  PERIOD_M5, RSI_Period, PRICE_CLOSE);
-   macdHandle = iMACD(_Symbol, PERIOD_M5, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
+   rsiHandle     = iRSI(_Symbol,  PERIOD_M5, RSI_Period, PRICE_CLOSE);
+   macdHandle    = iMACD(_Symbol, PERIOD_M5, MACD_Fast, MACD_Slow, MACD_Signal, PRICE_CLOSE);
+   adxHandle     = iADX(_Symbol,  PERIOD_M5, 14);
+   atrHandle     = iATR(_Symbol,  PERIOD_M5, 14);
+   emaFastHandle = iMA(_Symbol,   PERIOD_M5, 12, 0, MODE_EMA, PRICE_CLOSE);
+   emaSlowHandle = iMA(_Symbol,   PERIOD_M5, 26, 0, MODE_EMA, PRICE_CLOSE);
 
-   if(rsiHandle == INVALID_HANDLE || macdHandle == INVALID_HANDLE)
+   if(rsiHandle == INVALID_HANDLE || macdHandle == INVALID_HANDLE ||
+      adxHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE ||
+      emaFastHandle == INVALID_HANDLE || emaSlowHandle == INVALID_HANDLE)
    {
       Print("ERROR: Indicator handle failed");
       return(INIT_FAILED);
@@ -562,8 +586,12 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(rsiHandle  != INVALID_HANDLE) IndicatorRelease(rsiHandle);
-   if(macdHandle != INVALID_HANDLE) IndicatorRelease(macdHandle);
+   if(rsiHandle     != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+   if(macdHandle    != INVALID_HANDLE) IndicatorRelease(macdHandle);
+   if(adxHandle     != INVALID_HANDLE) IndicatorRelease(adxHandle);
+   if(atrHandle     != INVALID_HANDLE) IndicatorRelease(atrHandle);
+   if(emaFastHandle != INVALID_HANDLE) IndicatorRelease(emaFastHandle);
+   if(emaSlowHandle != INVALID_HANDLE) IndicatorRelease(emaSlowHandle);
    Print(EA_Name, " stopped. Reason: ", reason);
 }
 
@@ -621,52 +649,74 @@ void OnTick()
    double nearestFib = 0;
    string direction  = "";
 
-   // === 5-LAYER SIGNAL EVALUATION ===
+   // === ORCHESTRATOR v2 — FULL OVERRIDE ===
+   // The 5-layer Fibonacci confirmation logic is bypassed; the orchestrator's
+   // decision (BUY/SELL/HOLD) is authoritative. Fib levels are still used
+   // afterward purely for SL/TP placement, not for gating entry.
 
-   // Layer 1 — Fibonacci Proximity
-   if(!CheckFibProximity(price, nearestFib, direction))
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spread = (ask - price) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+
+   double atrBuf[]; ArraySetAsSeries(atrBuf, true);
+   double atr = 0;
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0)
+      atr = atrBuf[0] / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+
+   double adxBuf[]; ArraySetAsSeries(adxBuf, true);
+   double adx = 0;
+   if(CopyBuffer(adxHandle, 0, 0, 1, adxBuf) > 0) adx = adxBuf[0];
+
+   double rsiBuf[]; ArraySetAsSeries(rsiBuf, true);
+   double rsi = 50;
+   if(CopyBuffer(rsiHandle, 0, 0, 1, rsiBuf) > 0) rsi = rsiBuf[0];
+
+   double emaFastBuf[], emaSlowBuf[];
+   ArraySetAsSeries(emaFastBuf, true);
+   ArraySetAsSeries(emaSlowBuf, true);
+   double emaFast = 0, emaSlow = 0;
+   if(CopyBuffer(emaFastHandle, 0, 0, 1, emaFastBuf) > 0) emaFast = emaFastBuf[0];
+   if(CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlowBuf) > 0) emaSlow = emaSlowBuf[0];
+
+   double volatility = OrchCalcVolatility(_Symbol, PERIOD_M5, 20);
+   double momentum   = OrchCalcMomentum(_Symbol, PERIOD_M5, 10);
+
+   long volBuf[]; ArraySetAsSeries(volBuf, true);
+   double volume = 0;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 1, volBuf) > 0) volume = (double)volBuf[0];
+
+   int newsRisk = 0; // wire to a news calendar feed if/when available
+
+   string payload = OrchBuildPayload(price, spread, atr, adx, volatility, momentum,
+                                      volume, rsi, emaFast, emaSlow, newsRisk,
+                                      MaxSpreadPips, AllowNewsTrading, AllowCrisisTrading,
+                                      MaxAccountDrawdownPct);
+
+   OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
+
+   if(!dec.valid)
    {
-      Print("Signal: HOLD | Layer 1 failed — not near Fib level");
+      Print("ORCH | Unreachable — holding, no trade this tick");
       return;
    }
 
-   // Layer 2 — Velocity
-   if(!CheckVelocity(direction))
+   Print("ORCH | Decision:", dec.decision, " Confidence:", DoubleToString(dec.confidence, 3),
+         " Regime:", dec.regime, " Score:", DoubleToString(dec.ensemble_score, 3));
+
+   LastRegime = dec.regime;
+
+   if(dec.decision == "HOLD")
    {
-      Print("Signal: HOLD | Layer 2 failed — insufficient velocity");
+      Print("Signal: HOLD | Orchestrator declined the trade");
       return;
    }
 
-   // Layer 3 — Volume Surge
-   if(!CheckVolumeSurge())
-   {
-      Print("Signal: HOLD | Layer 3 failed — no volume surge");
-      return;
-   }
+   direction = dec.decision; // "BUY" or "SELL" — orchestrator is authoritative
 
-   // Layer 4 — Fibonacci Break and Close
-   if(!CheckFibBreak(nearestFib, direction))
-   {
-      Print("Signal: HOLD | Layer 4 failed — no confirmed Fib break");
-      return;
-   }
+   double distance;
+   nearestFib = GetNearestFibLevel(price, distance);
 
-   // Layer 5 — Momentum Acceleration
-   if(!CheckMomentumAcceleration(direction))
-   {
-      Print("Signal: HOLD | Layer 5 failed — momentum not accelerating");
-      return;
-   }
-
-   // Dynamic spread check
-   if(!CheckDynamicSpread(nearestFib))
-   {
-      Print("Signal: HOLD | Spread too wide relative to Fib distance");
-      return;
-   }
-
-   // === ALL 5 LAYERS CONFIRMED — ENTER TRADE ===
-   Print("=== SIGNAL CONFIRMED | All 5 layers passed | Direction: ", direction, " ===");
+   Print("=== ORCHESTRATOR SIGNAL | Direction: ", direction,
+         " | Confidence: ", DoubleToString(dec.confidence, 3), " ===");
 
    double sl, tp1, tp2, tp3;
    GetTradeLevels(direction, nearestFib, sl, tp1, tp2, tp3);
