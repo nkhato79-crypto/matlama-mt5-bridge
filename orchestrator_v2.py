@@ -42,9 +42,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator_v2")
 
-# Load models
-quant_model  = joblib.load(os.path.join(BASE_DIR, "quant_model.pkl"))
-quant_scaler = joblib.load(os.path.join(BASE_DIR, "quant_scaler.pkl"))
+# Load models — Quant model is optional; if not yet trained/saved, the
+# orchestrator degrades gracefully to RF-only scoring rather than crashing.
+QUANT_AVAILABLE = True
+try:
+    quant_model  = joblib.load(os.path.join(BASE_DIR, "quant_model.pkl"))
+    quant_scaler = joblib.load(os.path.join(BASE_DIR, "quant_scaler.pkl"))
+except FileNotFoundError as e:
+    logger.warning(f"Quant model not found, running RF-only: {e}")
+    quant_model  = None
+    quant_scaler = None
+    QUANT_AVAILABLE = False
 
 mbv3_model   = joblib.load(os.path.join(BASE_DIR, "rf_model.pkl"))
 mbv3_scaler  = joblib.load(os.path.join(BASE_DIR, "scaler.pkl"))
@@ -157,6 +165,9 @@ def score_model(model, scaler, features, order):
     i.e. classes_ == [0, 1] where 1 = BUY. If your models were trained
     with a different label scheme, adjust the proba indexing below.
     """
+    if model is None or scaler is None:
+        return 0.0
+
     try:
         vector = np.array([[features.get(k, 0.0) for k in order]])
         scaled = scaler.transform(vector)
@@ -191,6 +202,9 @@ BASE_THRESHOLD = 0.30  # minimum |ensemble_score| required to authorize a trade
 
 
 def compute_ensemble(quant_score, mbv3_score, regime):
+    if not QUANT_AVAILABLE:
+        return float(np.clip(mbv3_score, -1.0, 1.0))
+
     weights = REGIME_WEIGHTS.get(regime, {"quant": 0.5, "mbv3": 0.5})
     ensemble = (quant_score * weights["quant"]) + (mbv3_score * weights["mbv3"])
     return float(np.clip(ensemble, -1.0, 1.0))
@@ -329,11 +343,12 @@ def report_trade():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status": "ok",
+        "status": "ok" if QUANT_AVAILABLE else "degraded",
         "models_loaded": {
-            "quant_model": quant_model is not None,
+            "quant_model": QUANT_AVAILABLE,
             "mbv3_model": mbv3_model is not None,
         },
+        "note": None if QUANT_AVAILABLE else "Quant model not found — running RF-only",
         "trade_memory_size": len(memory.trades),
         "timestamp": datetime.utcnow().isoformat() + "Z",
     })
