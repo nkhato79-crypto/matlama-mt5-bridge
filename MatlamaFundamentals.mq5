@@ -19,6 +19,8 @@ input string YieldTrend       = "DOWN";    // DOWN or UP
 input int    NewsBlockMins    = 30;        // Block trades X mins before HIGH news
 input int    MagicMB          = 20260101;  // matlamaBridgeV3
 input int    MagicScalp       = 20260103;  // MatlamaScalper
+input int    MagicQuant       = 20260201;  // MatlamaQuant
+input int    MagicHFT         = 20260102;  // MatlamaBridgeHFT
 
 //--- News Calendar (update weekly, times in UTC)
 //--- Format: "YYYY.MM.DD HH:MM|NAME|HIGH or LOW"
@@ -118,6 +120,8 @@ void OnTick()
    {
       CloseByMagic(MagicMB);
       CloseByMagic(MagicScalp);
+      CloseByMagic(MagicQuant);
+      CloseByMagic(MagicHFT);
       return;
    }
 

@@ -8,6 +8,7 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "OrchestratorClient.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaScalper v1";
@@ -28,6 +29,13 @@ input int      RSI_OS         = 35;       // RSI oversold
 input bool     LondonSession  = true;     // Trade London session
 input bool     NYSession      = true;     // Trade NY session
 
+//--- Orchestrator v2 Settings (full override — replaces EMA/RSI signal logic)
+input string   ORCH_SERVER            = "http://127.0.0.1:7000/decision_v2";
+input string   ORCH_REPORT            = "http://127.0.0.1:7000/report_trade";
+input bool     AllowNewsTrading       = false;
+input bool     AllowCrisisTrading     = false;
+input double   MaxAccountDrawdownPct  = 0.20;
+
 //--- Global Variables
 CTrade   trade;
 double   dailyStartBalance;
@@ -36,6 +44,36 @@ datetime lastBarTime = 0;
 int      emaFastHandle;
 int      emaSlowHandle;
 int      rsiHandle;
+int      atrHandle;
+int      adxHandle;
+ulong    lastLoggedTicket = 0;
+string   LastRegime = "UNKNOWN";
+
+//+------------------------------------------------------------------+
+//| Detect newly closed trades and report them to the orchestrator   |
+//+------------------------------------------------------------------+
+void LogClosedTrades()
+{
+   HistorySelect(TimeCurrent() - 86400 * 7, TimeCurrent());
+   int total = HistoryDealsTotal();
+   if(total == 0) return;
+
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket <= lastLoggedTicket) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (ulong)MagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+
+      double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      lastLoggedTicket = ticket;
+      Print("Scalper trade logged | Ticket:", ticket, " Profit:", profit);
+
+      int winFlag = (profit > 0) ? 1 : 0;
+      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
+   }
+}
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -43,10 +81,14 @@ int OnInit()
    emaFastHandle = iMA(_Symbol, PERIOD_M5, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
    emaSlowHandle = iMA(_Symbol, PERIOD_M5, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
    rsiHandle     = iRSI(_Symbol, PERIOD_M5, RSI_Period, PRICE_CLOSE);
+   atrHandle     = iATR(_Symbol, PERIOD_M5, 14);
+   adxHandle     = iADX(_Symbol, PERIOD_M5, 14);
 
    if(emaFastHandle == INVALID_HANDLE ||
       emaSlowHandle == INVALID_HANDLE ||
-      rsiHandle     == INVALID_HANDLE)
+      rsiHandle     == INVALID_HANDLE ||
+      atrHandle     == INVALID_HANDLE ||
+      adxHandle     == INVALID_HANDLE)
    {
       Print("ERROR: Indicator handle failed");
       return(INIT_FAILED);
@@ -75,12 +117,16 @@ void OnDeinit(const int reason)
    IndicatorRelease(emaFastHandle);
    IndicatorRelease(emaSlowHandle);
    IndicatorRelease(rsiHandle);
+   IndicatorRelease(atrHandle);
+   IndicatorRelease(adxHandle);
    Print(EA_Name, " stopped. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   LogClosedTrades();
+
    // Reset daily balance at midnight
    MqlDateTime now, reset;
    TimeToStruct(TimeCurrent(), now);
@@ -123,38 +169,64 @@ void OnTick()
       return;
    }
 
-   // Get indicator values
-   double emaFast[], emaSlow[], rsi[];
-   ArraySetAsSeries(emaFast, true);
-   ArraySetAsSeries(emaSlow, true);
-   ArraySetAsSeries(rsi,     true);
+   // === ORCHESTRATOR v2 — FULL OVERRIDE ===
+   // EMA cross / RSI signal logic is bypassed; the orchestrator's decision
+   // (BUY/SELL/HOLD) is authoritative. Session filter, spread filter, max
+   // trades, and daily loss checks above remain as hard structural gates.
 
-   if(CopyBuffer(emaFastHandle, 0, 0, 3, emaFast) < 3) return;
-   if(CopyBuffer(emaSlowHandle, 0, 0, 3, emaSlow) < 3) return;
-   if(CopyBuffer(rsiHandle,     0, 0, 3, rsi)     < 3) return;
+   double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask0   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spreadPips = (ask0 - price) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
 
-   // Signal logic
-   bool emaCrossUp   = emaFast[1] > emaSlow[1] && emaFast[2] <= emaSlow[2];
-   bool emaCrossDown = emaFast[1] < emaSlow[1] && emaFast[2] >= emaSlow[2];
-   bool rsiOversold  = rsi[1] < RSI_OS;
-   bool rsiOverbought= rsi[1] > RSI_OB;
-   bool emaAbove     = emaFast[1] > emaSlow[1];
-   bool emaBelow     = emaFast[1] < emaSlow[1];
+   double atrBuf[]; ArraySetAsSeries(atrBuf, true);
+   double atr = 0;
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) > 0)
+      atr = atrBuf[0] / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
 
-   string signal = "HOLD";
+   double adxBuf[]; ArraySetAsSeries(adxBuf, true);
+   double adx = 0;
+   if(CopyBuffer(adxHandle, 0, 0, 1, adxBuf) > 0) adx = adxBuf[0];
 
-   // BUY: EMA cross up + RSI not overbought OR EMA above + RSI oversold bounce
-   if((emaCrossUp && !rsiOverbought) || (emaAbove && rsiOversold))
-      signal = "BUY";
+   double emaFastBuf[], emaSlowBuf[], rsiBuf[];
+   ArraySetAsSeries(emaFastBuf, true);
+   ArraySetAsSeries(emaSlowBuf, true);
+   ArraySetAsSeries(rsiBuf, true);
+   double emaFastVal = 0, emaSlowVal = 0, rsiVal = 50;
+   if(CopyBuffer(emaFastHandle, 0, 0, 1, emaFastBuf) > 0) emaFastVal = emaFastBuf[0];
+   if(CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlowBuf) > 0) emaSlowVal = emaSlowBuf[0];
+   if(CopyBuffer(rsiHandle,     0, 0, 1, rsiBuf)     > 0) rsiVal     = rsiBuf[0];
 
-   // SELL: EMA cross down + RSI not oversold OR EMA below + RSI overbought drop
-   if((emaCrossDown && !rsiOversold) || (emaBelow && rsiOverbought))
-      signal = "SELL";
+   double volatility = OrchCalcVolatility(_Symbol, PERIOD_M5, 20);
+   double momentum   = OrchCalcMomentum(_Symbol, PERIOD_M5, 10);
 
-   Print("Scalper | EMA Fast:", DoubleToString(emaFast[1], 2),
-         " Slow:", DoubleToString(emaSlow[1], 2),
-         " RSI:", DoubleToString(rsi[1], 1),
-         " Signal:", signal);
+   long volBuf[]; ArraySetAsSeries(volBuf, true);
+   double volume = 0;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 1, volBuf) > 0) volume = (double)volBuf[0];
+
+   int newsRisk = 0; // wire to a news calendar feed if/when available
+
+   string payload = OrchBuildPayload(price, spreadPips, atr, adx, volatility, momentum,
+                                      volume, rsiVal, emaFastVal, emaSlowVal, newsRisk,
+                                      (double)MaxSpread, AllowNewsTrading, AllowCrisisTrading,
+                                      MaxAccountDrawdownPct);
+
+   OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
+
+   if(!dec.valid)
+   {
+      Print("Scalper | ORCH unreachable — holding, no trade this tick");
+      return;
+   }
+
+   LastRegime = dec.regime;
+   string signal = dec.decision; // "BUY" / "SELL" / "HOLD" — orchestrator is authoritative
+
+   Print("Scalper | ORCH Decision:", signal,
+         " Confidence:", DoubleToString(dec.confidence, 3),
+         " Regime:", dec.regime,
+         " EMA Fast:", DoubleToString(emaFastVal, 2),
+         " Slow:", DoubleToString(emaSlowVal, 2),
+         " RSI:", DoubleToString(rsiVal, 1));
 
    if(!AutoTrade || signal == "HOLD") return;
 
