@@ -39,14 +39,16 @@ TRADES_CSV = os.path.join(MT5_FILES, "quant_trades.csv")
 MIN_TRADES          = 50
 RETRAIN_INTERVAL_H  = 24
 
-# Quant-specific feature columns
+# Quant-specific feature columns.
+# duration_min intentionally excluded — it's only known after a trade
+# closes, so it can never be supplied to the model at real-time decision
+# time. Kept in the CSV itself for record-keeping, just not used to train.
 FEATURE_COLS = [
     "fib_level",       # which Fibonacci level triggered the trade
-    "velocity",        # pips per 3 ticks at entry
+    "velocity",        # pips per 3 M1 candles at entry
     "volume_ratio",    # volume surge ratio at entry
     "rsi_accel",       # RSI acceleration at entry
-    "signal_score",    # number of layers confirmed (always 5 for MatlamaQuant)
-    "duration_min",    # how long the trade lasted
+    "signal_score",    # number of confirmation layers active at entry (0-5)
 ]
 
 os.makedirs(MODEL_DIR, exist_ok=True)

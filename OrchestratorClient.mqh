@@ -57,17 +57,20 @@ double OrchJsonGetDouble(string json, string key)
 //+------------------------------------------------------------------+
 //| Build the JSON payload for /decision_v2                          |
 //+------------------------------------------------------------------+
-string OrchBuildPayload(double price, double spread, double atr, double adx,
+string OrchBuildPayload(string strategy,
+                         double price, double spread, double atr, double adx,
                          double volatility, double momentum, double volume,
                          double rsi, double ema_fast, double ema_slow,
                          int news_risk, double max_spread,
                          bool allow_news_trading, bool allow_crisis_trading,
-                         double max_account_drawdown_pct)
+                         double max_account_drawdown_pct,
+                         string extra_fields = "")
 {
    double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
 
    string json = "{";
+   json += "\"strategy\":\"" + strategy + "\",";
    json += "\"price\":"      + DoubleToString(price, 5)      + ",";
    json += "\"spread\":"     + DoubleToString(spread, 5)     + ",";
    json += "\"atr\":"        + DoubleToString(atr, 5)        + ",";
@@ -85,6 +88,7 @@ string OrchBuildPayload(double price, double spread, double atr, double adx,
    json += "\"allow_news_trading\":"   + (allow_news_trading   ? "true" : "false") + ",";
    json += "\"allow_crisis_trading\":" + (allow_crisis_trading ? "true" : "false") + ",";
    json += "\"max_account_drawdown_pct\":" + DoubleToString(max_account_drawdown_pct, 3);
+   if(extra_fields != "") json += "," + extra_fields;
    json += "}";
    return json;
 }
@@ -138,11 +142,12 @@ OrchDecision OrchGetDecision(string server_url, string payload)
 //+------------------------------------------------------------------+
 //| Report a closed trade back to /report_trade for the feedback loop|
 //+------------------------------------------------------------------+
-void OrchReportTrade(string report_url, string regime, int win, double score)
+void OrchReportTrade(string report_url, string strategy, string regime, int win, double score)
 {
    if(regime == "" ) regime = "MIXED";
 
    string json = "{";
+   json += "\"strategy\":\"" + strategy + "\",";
    json += "\"regime\":\"" + regime + "\",";
    json += "\"result\":"   + (string)win + ",";
    json += "\"score\":"    + DoubleToString(score, 4);

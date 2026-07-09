@@ -67,7 +67,7 @@ int      emaSlowHandle;
 string   LastRegime = "UNKNOWN";
 
 //--- CSV logging
-string   CSV_PATH = "hft_trades.csv";
+string   CSV_PATH = "bridgev3_trades.csv"; // renamed from hft_trades.csv — was colliding with MatlamaBridgeHFT.mq5, which writes to the same filename with incompatible column meaning
 ulong    lastLoggedTicket = 0;
 
 //+------------------------------------------------------------------+
@@ -186,7 +186,7 @@ void LogClosedTrades()
       Print("Trade logged | Ticket:", ticket, " Profit:", profit);
 
       int winFlag = (profit > 0) ? 1 : 0;
-      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
+      OrchReportTrade(ORCH_REPORT, "MBV3", LastRegime, winFlag, profit);
    }
 
    FileClose(handle);
@@ -303,10 +303,21 @@ void OnTick()
 
    int newsRisk = 0; // wire to a news calendar feed if/when available
 
-   string payload = OrchBuildPayload(price, spread, atr, adx, volatility, momentum,
+   // Live, non-gating computation of BridgeV3's own 9-layer scores. These
+   // no longer gate entry (orchestrator is authoritative), but the
+   // orchestrator's dedicated MBV3 model was trained on exactly these
+   // features, so they must be supplied for a meaningful prediction.
+   int    bScoreLive   = EvaluateSignal("BUY");
+   int    sScoreLive   = EvaluateSignal("SELL");
+   int    sigScoreLive = MathMax(bScoreLive, sScoreLive);
+   string extraFields  = "\"buy_score\":" + (string)bScoreLive +
+                          ",\"sell_score\":" + (string)sScoreLive +
+                          ",\"signal_score\":" + (string)sigScoreLive;
+
+   string payload = OrchBuildPayload("MBV3", price, spread, atr, adx, volatility, momentum,
                                       volume, rsi, emaFast, emaSlow, newsRisk,
                                       MaxSpreadPips, AllowNewsTrading, AllowCrisisTrading,
-                                      MaxAccountDrawdownPct);
+                                      MaxAccountDrawdownPct, extraFields);
 
    OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
 

@@ -48,6 +48,27 @@ int      atrHandle;
 int      adxHandle;
 ulong    lastLoggedTicket = 0;
 string   LastRegime = "UNKNOWN";
+string   CSV_PATH  = "scalper_trades.csv";
+
+void InitCSV()
+{
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE)
+   {
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      if(handle != INVALID_HANDLE)
+      {
+         FileWrite(handle,
+            "ticket","symbol","type","open_time","close_time",
+            "open_price","close_price","volume","profit",
+            "swap","commission","duration_min",
+            "ema_diff_pips","momentum_pips","rsi");
+         FileClose(handle);
+         Print("Scalper CSV initialized: ", CSV_PATH);
+      }
+   }
+   else FileClose(handle);
+}
 
 //+------------------------------------------------------------------+
 //| Detect newly closed trades and report them to the orchestrator   |
@@ -58,6 +79,10 @@ void LogClosedTrades()
    int total = HistoryDealsTotal();
    if(total == 0) return;
 
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   if(handle == INVALID_HANDLE) return;
+   FileSeek(handle, 0, SEEK_END);
+
    for(int i = 0; i < total; i++)
    {
       ulong ticket = HistoryDealGetTicket(i);
@@ -66,13 +91,68 @@ void LogClosedTrades()
       if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (ulong)MagicNumber) continue;
       if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
 
-      double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      long     dtype      = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      string   typeStr    = (dtype == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+      datetime closeTime  = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      double   closePrice = HistoryDealGetDouble(ticket, DEAL_PRICE);
+      double   volume     = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+      double   profit     = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      double   swap       = HistoryDealGetDouble(ticket, DEAL_SWAP);
+      double   comm       = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      double   openPrice  = 0;
+      datetime entryTime  = 0;
+
+      ulong posId = (ulong)HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      for(int j = 0; j < total; j++)
+      {
+         ulong t2 = HistoryDealGetTicket(j);
+         if((ulong)HistoryDealGetInteger(t2, DEAL_POSITION_ID) == posId &&
+            HistoryDealGetInteger(t2, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         {
+            openPrice = HistoryDealGetDouble(t2, DEAL_PRICE);
+            entryTime = (datetime)HistoryDealGetInteger(t2, DEAL_TIME);
+            break;
+         }
+      }
+
+      int durationMin = (int)((closeTime - entryTime) / 60);
+
+      // Compute real Scalper features at close-time for the training CSV
+      double pipSizeS = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+      double emaFastS[], emaSlowS[], rsiS[];
+      ArraySetAsSeries(emaFastS, true);
+      ArraySetAsSeries(emaSlowS, true);
+      ArraySetAsSeries(rsiS, true);
+      double emaDiffLog = 0, rsiLog = 50;
+      if(CopyBuffer(emaFastHandle, 0, 0, 1, emaFastS) > 0 &&
+         CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlowS) > 0)
+         emaDiffLog = (emaFastS[0] - emaSlowS[0]) / pipSizeS;
+      if(CopyBuffer(rsiHandle, 0, 0, 1, rsiS) > 0) rsiLog = rsiS[0];
+      double momentumLog = OrchCalcMomentum(_Symbol, PERIOD_M5, 10);
+
+      FileWrite(handle,
+         (string)ticket, _Symbol, typeStr,
+         TimeToString(entryTime,  TIME_DATE|TIME_MINUTES),
+         TimeToString(closeTime,  TIME_DATE|TIME_MINUTES),
+         DoubleToString(openPrice,  _Digits),
+         DoubleToString(closePrice, _Digits),
+         DoubleToString(volume, 2),
+         DoubleToString(profit, 2),
+         DoubleToString(swap,   2),
+         DoubleToString(comm,   2),
+         (string)durationMin,
+         DoubleToString(emaDiffLog,  2),
+         DoubleToString(momentumLog, 2),
+         DoubleToString(rsiLog,      1)
+      );
+
       lastLoggedTicket = ticket;
       Print("Scalper trade logged | Ticket:", ticket, " Profit:", profit);
 
       int winFlag = (profit > 0) ? 1 : 0;
-      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
+      OrchReportTrade(ORCH_REPORT, "SCALPER", LastRegime, winFlag, profit);
    }
+   FileClose(handle);
 }
 
 //+------------------------------------------------------------------+
@@ -100,6 +180,8 @@ int OnInit()
 
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    dailyResetTime    = TimeCurrent();
+
+   InitCSV();
 
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",    _Symbol);
@@ -205,10 +287,16 @@ void OnTick()
 
    int newsRisk = 0; // wire to a news calendar feed if/when available
 
-   string payload = OrchBuildPayload(price, spreadPips, atr, adx, volatility, momentum,
+   // Live Scalper-specific features for the dedicated SCALPER model.
+   double emaDiffPips     = (emaFastVal - emaSlowVal) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+   double momentumScalp   = OrchCalcMomentum(_Symbol, PERIOD_M5, 10);
+   string extraFields     = "\"ema_diff_pips\":" + DoubleToString(emaDiffPips, 2) +
+                             ",\"momentum_pips\":" + DoubleToString(momentumScalp, 2);
+
+   string payload = OrchBuildPayload("SCALPER", price, spreadPips, atr, adx, volatility, momentum,
                                       volume, rsiVal, emaFastVal, emaSlowVal, newsRisk,
                                       (double)MaxSpread, AllowNewsTrading, AllowCrisisTrading,
-                                      MaxAccountDrawdownPct);
+                                      MaxAccountDrawdownPct, extraFields);
 
    OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
 

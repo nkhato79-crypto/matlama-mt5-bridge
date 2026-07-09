@@ -297,7 +297,7 @@ void InitCSV()
             "ticket","symbol","type","open_time","close_time",
             "open_price","close_price","volume","profit",
             "swap","commission","duration_min",
-            "buy_score","sell_score","signal_score");
+            "wick_pips","momentum_pips","volume_ratio","rsi");
          FileClose(handle);
          Print("HFT CSV initialized");
       }
@@ -366,6 +366,31 @@ void LogClosedTrades()
 
       int durationMin = (int)((closeTime - entryTime) / 60);
 
+      // Compute real HFT feature values at close-time for the training CSV
+      double pipSizeCsv = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+      MqlRates csvRates[]; ArraySetAsSeries(csvRates, true);
+      double wickPipsCsv = 0, momentumPipsCsv = 0;
+      if(CopyRates(_Symbol, PERIOD_M1, 0, 6, csvRates) >= 6)
+      {
+         double bHigh = MathMax(csvRates[1].open, csvRates[1].close);
+         double bLow  = MathMin(csvRates[1].open, csvRates[1].close);
+         wickPipsCsv     = MathMax((csvRates[1].high - bHigh) / pipSizeCsv,
+                                   (bLow - csvRates[1].low) / pipSizeCsv);
+         momentumPipsCsv = (csvRates[0].close - csvRates[5].close) / pipSizeCsv;
+      }
+      long volCsv[]; ArraySetAsSeries(volCsv, true);
+      double volRatioCsv = 0;
+      if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 11, volCsv) >= 11)
+      {
+         double avgV = 0;
+         for(int k = 1; k <= 10; k++) avgV += (double)volCsv[k];
+         avgV /= 10;
+         if(avgV > 0) volRatioCsv = (double)volCsv[0] / avgV;
+      }
+      double rsiCsv[]; ArraySetAsSeries(rsiCsv, true);
+      double rsiValCsv = 50;
+      if(CopyBuffer(rsiHandle, 0, 0, 1, rsiCsv) > 0) rsiValCsv = rsiCsv[0];
+
       FileWrite(handle,
          (string)ticket, _Symbol, typeStr,
          TimeToString(entryTime,   TIME_DATE|TIME_MINUTES),
@@ -377,14 +402,17 @@ void LogClosedTrades()
          DoubleToString(swap,   2),
          DoubleToString(comm,   2),
          (string)durationMin,
-         "3", "3", "3"   // HFT uses 3-layer confirmation
+         DoubleToString(wickPipsCsv,     2),
+         DoubleToString(momentumPipsCsv, 2),
+         DoubleToString(volRatioCsv,     2),
+         DoubleToString(rsiValCsv,       1)
       );
 
       lastLoggedTicket = ticket;
       Print("HFT trade logged | Ticket:", ticket, " Profit:", profit);
 
       int winFlag = (profit > 0) ? 1 : 0;
-      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
+      OrchReportTrade(ORCH_REPORT, "HFT", LastRegime, winFlag, profit);
    }
    FileClose(handle);
 }
@@ -533,10 +561,41 @@ void OnTick()
 
    int newsRisk = 0; // wire to a news calendar feed if/when available
 
-   string payload = OrchBuildPayload(price, spread, atr, adx, volatility, momentum,
+   // Live HFT-specific features for the dedicated HFT model.
+   // wick_pips: upper or lower wick of the last M1 candle (stop-hunt proxy)
+   // momentum_pips: price move over last 5 M1 candles
+   // volume_ratio: current M1 volume vs 10-bar average
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   MqlRates hftRates[]; ArraySetAsSeries(hftRates, true);
+   double wickPips = 0, momentumPips = 0;
+   if(CopyRates(_Symbol, PERIOD_M1, 0, 11, hftRates) >= 11)
+   {
+      double bodyHigh = MathMax(hftRates[1].open, hftRates[1].close);
+      double bodyLow  = MathMin(hftRates[1].open, hftRates[1].close);
+      double upperWick = (hftRates[1].high - bodyHigh) / pipSize;
+      double lowerWick = (bodyLow - hftRates[1].low)  / pipSize;
+      wickPips = MathMax(upperWick, lowerWick);
+      momentumPips = (hftRates[0].close - hftRates[5].close) / pipSize;
+   }
+
+   long volBufHFT[]; ArraySetAsSeries(volBufHFT, true);
+   double volRatioHFT = 0;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 11, volBufHFT) >= 11)
+   {
+      double avgVol = 0;
+      for(int k = 1; k <= 10; k++) avgVol += (double)volBufHFT[k];
+      avgVol /= 10;
+      if(avgVol > 0) volRatioHFT = (double)volBufHFT[0] / avgVol;
+   }
+
+   string extraFields = "\"wick_pips\":"     + DoubleToString(wickPips,     2) +
+                         ",\"momentum_pips\":" + DoubleToString(momentumPips, 2) +
+                         ",\"volume_ratio\":"  + DoubleToString(volRatioHFT,  2);
+
+   string payload = OrchBuildPayload("HFT", price, spread, atr, adx, volatility, momentum,
                                       volume, rsi, emaFast, emaSlow, newsRisk,
                                       MaxSpread, AllowNewsTrading, AllowCrisisTrading,
-                                      MaxAccountDrawdownPct);
+                                      MaxAccountDrawdownPct, extraFields);
 
    OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
 

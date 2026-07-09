@@ -3,17 +3,30 @@ Matlama Orchestrator v2 - Institutional Decision Engine
 -------------------------------------------------------
 Central policy layer for Matlama Quant Ecosystem.
 
+IMPORTANT ARCHITECTURE NOTE (v2.1 correction):
+Each strategy (MatlamaQuant, MatlamaBridgeV3, MatlamaBridgeHFT,
+MatlamaScalper) has its OWN dedicated model, trained on ITS OWN
+strategy-specific features. These feature spaces are not comparable
+across strategies (e.g. BridgeV3's buy_score/sell_score mean nothing
+to the Quant model, and vice versa) so there is no cross-model
+ensemble blending here — each request is scored only against the one
+model that matches its "strategy" field. Regime detection, the risk
+filter, the adaptive threshold, and trade memory are shared/generic
+across all strategies, since those operate on market-level conditions
+rather than strategy-internal features.
+
 Responsibilities:
 - Regime detection (Trend / Range / Crisis / News / Mixed)
-- Ensemble model scoring (Quant + Bridge/RF)
-- Trade memory tracking (win-rate + drawdown adaptation)
+- Per-strategy dedicated model scoring (Quant / BridgeV3 / HFT / Scalper)
+- Trade memory tracking (win-rate + drawdown adaptation), overall and
+  per-strategy
 - Risk-conditioned threshold adjustment
 - Final trade authorization (BUY / SELL / HOLD)
 
 Exposes:
-POST /decision_v2
-POST /report_trade   (feedback loop training)
-GET  /health         (status/monitoring)
+POST /decision_v2      (requires "strategy": "QUANT"|"MBV3"|"HFT"|"SCALPER")
+POST /report_trade     (feedback loop training)
+GET  /health           (status/monitoring)
 
 Runs: Flask (localhost:7000)
 """
@@ -42,32 +55,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator_v2")
 
-# Load models — Quant model is optional; if not yet trained/saved, the
-# orchestrator degrades gracefully to RF-only scoring rather than crashing.
-QUANT_AVAILABLE = True
-try:
-    quant_model  = joblib.load(os.path.join(BASE_DIR, "quant_model.pkl"))
-    quant_scaler = joblib.load(os.path.join(BASE_DIR, "quant_scaler.pkl"))
-except FileNotFoundError as e:
-    logger.warning(f"Quant model not found, running RF-only: {e}")
-    quant_model  = None
-    quant_scaler = None
-    QUANT_AVAILABLE = False
 
-mbv3_model   = joblib.load(os.path.join(BASE_DIR, "rf_model.pkl"))
-mbv3_scaler  = joblib.load(os.path.join(BASE_DIR, "scaler.pkl"))
+def load_pair(model_name, scaler_name, label):
+    """Load a (model, scaler) pair; degrade gracefully if not yet trained."""
+    try:
+        model  = joblib.load(os.path.join(BASE_DIR, model_name))
+        scaler = joblib.load(os.path.join(BASE_DIR, scaler_name))
+        logger.info(f"{label} model loaded OK")
+        return model, scaler, True
+    except FileNotFoundError as e:
+        logger.warning(f"{label} model not found, strategy will run HOLD-only: {e}")
+        return None, None, False
 
-# Feature order expected by each model. Adjust to match your actual
-# training column order (this MUST match how quant_model / rf_model
-# were fit, or scaling will silently corrupt predictions).
-QUANT_FEATURE_ORDER = [
-    "price", "spread", "atr", "adx", "volatility",
-    "momentum", "volume", "rsi"
-]
-MBV3_FEATURE_ORDER = [
-    "price", "spread", "atr", "adx", "volatility",
-    "ema_fast", "ema_slow", "rsi", "volume"
-]
+
+# Each strategy's own dedicated model. None of these are blended together —
+# a request for one strategy is only ever scored against its own model.
+quant_model,   quant_scaler,   QUANT_AVAILABLE   = load_pair("quant_model.pkl",   "quant_scaler.pkl",   "QUANT")
+mbv3_model,    mbv3_scaler,    MBV3_AVAILABLE    = load_pair("rf_model.pkl",      "scaler.pkl",         "MBV3 (BridgeV3)")
+hft_model,     hft_scaler,     HFT_AVAILABLE     = load_pair("hft_model.pkl",     "hft_scaler.pkl",     "HFT")
+scalper_model, scalper_scaler, SCALPER_AVAILABLE = load_pair("scalper_model.pkl", "scalper_scaler.pkl", "SCALPER")
+
+STRATEGIES = {
+    "QUANT":   {"model": quant_model,   "scaler": quant_scaler,   "available": QUANT_AVAILABLE,
+                # Real, pre-trade-computable features only. duration_min is
+                # deliberately excluded — it's only known after a trade
+                # closes, so it can never be supplied at decision time.
+                "feature_order": ["fib_level", "velocity", "volume_ratio", "rsi_accel", "signal_score"]},
+    "MBV3":    {"model": mbv3_model,    "scaler": mbv3_scaler,    "available": MBV3_AVAILABLE,
+                "feature_order": ["buy_score", "sell_score", "signal_score"]},
+    "HFT":     {"model": hft_model,     "scaler": hft_scaler,     "available": HFT_AVAILABLE,
+                "feature_order": ["wick_pips", "momentum_pips", "volume_ratio", "rsi"]},
+    "SCALPER": {"model": scalper_model, "scaler": scalper_scaler, "available": SCALPER_AVAILABLE,
+                "feature_order": ["ema_diff_pips", "rsi", "momentum_pips"]},
+}
+
 
 # =========================================================
 # TRADE MEMORY SYSTEM
@@ -79,6 +100,7 @@ class TradeMemory:
     def add(self, trade):
         """
         trade = {
+            "strategy": "QUANT",
             "regime": "TREND",
             "result": 1 or 0,
             "score": float
@@ -86,11 +108,13 @@ class TradeMemory:
         """
         self.trades.append(trade)
 
-    def win_rate(self, regime=None):
+    def win_rate(self, regime=None, strategy=None):
         data = list(self.trades)
 
         if regime:
             data = [t for t in data if t["regime"] == regime]
+        if strategy:
+            data = [t for t in data if t.get("strategy") == strategy]
 
         if len(data) == 0:
             return 0.5
@@ -98,19 +122,25 @@ class TradeMemory:
         wins = sum(t["result"] for t in data)
         return wins / len(data)
 
-    def drawdown_factor(self):
-        if len(self.trades) == 0:
+    def drawdown_factor(self, strategy=None):
+        data = list(self.trades)
+        if strategy:
+            data = [t for t in data if t.get("strategy") == strategy]
+
+        if len(data) == 0:
             return 1.0
 
-        losses = sum(1 for t in self.trades if t["result"] == 0)
-        ratio = losses / len(self.trades)
+        losses = sum(1 for t in data if t["result"] == 0)
+        ratio = losses / len(data)
 
         # clamp between 0.5 and 1.0
         return max(0.5, 1.0 - ratio)
 
-    def streak(self):
+    def streak(self, strategy=None):
         """Positive int = current win streak, negative int = current loss streak."""
         data = list(self.trades)
+        if strategy:
+            data = [t for t in data if t.get("strategy") == strategy]
         if not data:
             return 0
 
@@ -128,7 +158,7 @@ memory = TradeMemory()
 
 
 # =========================================================
-# REGIME ENGINE
+# REGIME ENGINE (shared across all strategies)
 # =========================================================
 def detect_regime(f):
     atr = f.get("atr", 0)
@@ -162,8 +192,8 @@ def score_model(model, scaler, features, order):
        0  => neutral
 
     Assumes model.predict_proba exists and class order is [SELL, BUY]
-    i.e. classes_ == [0, 1] where 1 = BUY. If your models were trained
-    with a different label scheme, adjust the proba indexing below.
+    i.e. classes_ == [0, 1] where 1 = BUY. If a model was trained with
+    a different label scheme, adjust the proba indexing below.
     """
     if model is None or scaler is None:
         return 0.0
@@ -185,50 +215,24 @@ def score_model(model, scaler, features, order):
 
 
 # =========================================================
-# ENSEMBLE + ADAPTIVE THRESHOLD
+# ADAPTIVE THRESHOLD (per-strategy, since each has its own memory)
 # =========================================================
-# Base model weights, re-balanced per regime. Trend-following regimes
-# lean on the Bridge RF (structure/momentum), range/mixed lean on Quant
-# (mean-reversion / pressure-point logic).
-REGIME_WEIGHTS = {
-    "TREND":  {"quant": 0.35, "mbv3": 0.65},
-    "RANGE":  {"quant": 0.65, "mbv3": 0.35},
-    "CRISIS": {"quant": 0.50, "mbv3": 0.50},
-    "NEWS":   {"quant": 0.50, "mbv3": 0.50},
-    "MIXED":  {"quant": 0.50, "mbv3": 0.50},
-}
-
-BASE_THRESHOLD = 0.30  # minimum |ensemble_score| required to authorize a trade
+BASE_THRESHOLD = 0.30  # minimum |score| required to authorize a trade
 
 
-def compute_ensemble(quant_score, mbv3_score, regime):
-    if not QUANT_AVAILABLE:
-        return float(np.clip(mbv3_score, -1.0, 1.0))
-
-    weights = REGIME_WEIGHTS.get(regime, {"quant": 0.5, "mbv3": 0.5})
-    ensemble = (quant_score * weights["quant"]) + (mbv3_score * weights["mbv3"])
-    return float(np.clip(ensemble, -1.0, 1.0))
-
-
-def adaptive_threshold(regime):
+def adaptive_threshold(regime, strategy):
     """
-    Threshold rises when recent performance in this regime is poor
-    (fewer trades get through) and falls when performance is strong.
-    Also widens automatically during a losing streak, tightens on a
-    winning streak, as an extra layer of aggressiveness control.
+    Threshold rises when recent performance (in this regime, for this
+    strategy) is poor, and falls when performance is strong. Also widens
+    automatically during a losing streak, tightens on a winning streak.
     """
-    wr = memory.win_rate(regime)
-    dd = memory.drawdown_factor()
-    streak = memory.streak()
+    wr = memory.win_rate(regime=regime, strategy=strategy)
+    dd = memory.drawdown_factor(strategy=strategy)
+    streak = memory.streak(strategy=strategy)
 
-    # wr=0.5 -> no adjustment; wr>0.5 lowers threshold (more permissive);
-    # wr<0.5 raises threshold (more conservative)
     wr_adjustment = (0.5 - wr) * 0.4
-
-    # drawdown_factor in [0.5, 1.0]; lower dd (worse drawdown) raises threshold
     dd_adjustment = (1.0 - dd) * 0.3
 
-    # losing streak of 3+ adds extra caution; winning streak of 3+ loosens slightly
     streak_adjustment = 0.0
     if streak <= -3:
         streak_adjustment = 0.05
@@ -240,7 +244,7 @@ def adaptive_threshold(regime):
 
 
 # =========================================================
-# RISK FILTER
+# RISK FILTER (shared across all strategies)
 # =========================================================
 def risk_filter(f, regime):
     """
@@ -277,40 +281,47 @@ def risk_filter(f, regime):
 def decision_v2():
     f = request.get_json(force=True) or {}
 
+    strategy = f.get("strategy", "").upper()
+    if strategy not in STRATEGIES:
+        return jsonify({
+            "decision": "HOLD",
+            "error": f"unknown or missing 'strategy' field: {strategy!r}. "
+                     f"Must be one of {list(STRATEGIES.keys())}",
+        }), 400
+
+    cfg = STRATEGIES[strategy]
     regime = detect_regime(f)
 
-    quant_score = score_model(quant_model, quant_scaler, f, QUANT_FEATURE_ORDER)
-    mbv3_score = score_model(mbv3_model, mbv3_scaler, f, MBV3_FEATURE_ORDER)
-    ensemble_score = compute_ensemble(quant_score, mbv3_score, regime)
+    score = score_model(cfg["model"], cfg["scaler"], f, cfg["feature_order"])
 
     passed, reason = risk_filter(f, regime)
-    threshold = adaptive_threshold(regime)
+    threshold = adaptive_threshold(regime, strategy)
 
-    if not passed:
+    if not cfg["available"]:
         decision = "HOLD"
-    elif ensemble_score >= threshold:
+    elif not passed:
+        decision = "HOLD"
+    elif score >= threshold:
         decision = "BUY"
-    elif ensemble_score <= -threshold:
+    elif score <= -threshold:
         decision = "SELL"
     else:
         decision = "HOLD"
 
     response = {
         "decision": decision,
-        "confidence": round(abs(ensemble_score), 4),
-        "ensemble_score": round(ensemble_score, 4),
+        "confidence": round(abs(score), 4),
+        "ensemble_score": round(score, 4),  # kept for EA compatibility; not actually an ensemble anymore
         "regime": regime,
+        "strategy": strategy,
+        "model_available": cfg["available"],
         "threshold_used": round(threshold, 4),
-        "model_scores": {
-            "quant": round(quant_score, 4),
-            "mbv3": round(mbv3_score, 4),
-        },
         "risk_check": {"passed": passed, "reason": reason},
         "memory_stats": {
-            "win_rate_regime": round(memory.win_rate(regime), 4),
-            "win_rate_overall": round(memory.win_rate(), 4),
-            "drawdown_factor": round(memory.drawdown_factor(), 4),
-            "streak": memory.streak(),
+            "win_rate_strategy": round(memory.win_rate(strategy=strategy), 4),
+            "win_rate_regime": round(memory.win_rate(regime=regime, strategy=strategy), 4),
+            "drawdown_factor": round(memory.drawdown_factor(strategy=strategy), 4),
+            "streak": memory.streak(strategy=strategy),
         },
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
@@ -324,6 +335,7 @@ def report_trade():
     f = request.get_json(force=True) or {}
 
     trade = {
+        "strategy": f.get("strategy", "UNKNOWN").upper(),
         "regime": f.get("regime", "MIXED"),
         "result": int(f.get("result", 0)),   # 1 = win, 0 = loss
         "score": float(f.get("score", 0.0)),
@@ -333,22 +345,23 @@ def report_trade():
     logger.info(f"TRADE_REPORTED {trade}")
     return jsonify({
         "status": "recorded",
+        "win_rate_strategy": round(memory.win_rate(strategy=trade["strategy"]), 4),
         "win_rate_overall": round(memory.win_rate(), 4),
-        "win_rate_regime": round(memory.win_rate(trade["regime"]), 4),
-        "drawdown_factor": round(memory.drawdown_factor(), 4),
-        "streak": memory.streak(),
+        "drawdown_factor": round(memory.drawdown_factor(strategy=trade["strategy"]), 4),
+        "streak": memory.streak(strategy=trade["strategy"]),
     })
 
 
 @app.route("/health", methods=["GET"])
 def health():
+    availability = {name: cfg["available"] for name, cfg in STRATEGIES.items()}
+    all_ok = all(availability.values())
+    missing = [name for name, ok in availability.items() if not ok]
+
     return jsonify({
-        "status": "ok" if QUANT_AVAILABLE else "degraded",
-        "models_loaded": {
-            "quant_model": QUANT_AVAILABLE,
-            "mbv3_model": mbv3_model is not None,
-        },
-        "note": None if QUANT_AVAILABLE else "Quant model not found — running RF-only",
+        "status": "ok" if all_ok else "degraded",
+        "models_loaded": availability,
+        "note": None if all_ok else f"Missing models for: {missing} — those strategies will HOLD until trained",
         "trade_memory_size": len(memory.trades),
         "timestamp": datetime.utcnow().isoformat() + "Z",
     })

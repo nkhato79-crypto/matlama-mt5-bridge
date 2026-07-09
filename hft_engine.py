@@ -1,26 +1,26 @@
 """
-Matlama Gold Trading - ML Trainer (BridgeV3)
+Matlama HFT Engine - ML Trainer
 Trains a Random Forest classifier on logged trade history
-(bridgev3_trades.csv, written by matlamabridgeV3.mq5 into the MT5
-sandbox Files folder).
+(hft_trades.csv, written by MatlamaBridgeHFT.mq5 into the MT5 sandbox
+Files folder).
 
-CSV Schema (actual columns from MatlamaBridgeV3):
+CSV Schema:
 ticket, symbol, type, open_time, close_time, open_price, close_price,
-volume, profit, swap, commission, duration_min, buy_score, sell_score, signal_score
+volume, profit, swap, commission, duration_min, wick_pips, momentum_pips,
+volume_ratio, rsi
 
-Result is derived from profit > 0 (win=1, loss=0) — no separate result column needed.
+Result is derived from profit > 0 (win=1, loss=0).
 
-NOTE: duration_min is logged for record-keeping but deliberately excluded
-from FEATURE_COLS below — it's only known after a trade closes, so it can
-never be supplied to the model at real-time decision time. Training on it
-would create a feature the orchestrator can never actually provide.
+duration_min is logged for record-keeping but excluded from FEATURE_COLS
+— it's only known after a trade closes, so it can never be supplied to
+the model at real-time decision time.
 
 Retrains on a 24-hour cycle, only if at least 50 closed trades are available.
-Saves model + scaler to C:\\Matlama\\model\\ as rf_model.pkl / scaler.pkl,
-which the orchestrator loads for the "MBV3" strategy.
+Saves model + scaler to C:\\Matlama\\model\\ as hft_model.pkl / hft_scaler.pkl,
+which the orchestrator loads for the "HFT" strategy.
 
-Run manually: python ml_trainer.py
-Task Scheduler: Matlama_MLTrainer (daily 3:00 AM, SYSTEM)
+Run manually: python hft_engine.py
+Task Scheduler: Matlama_HFTEngine (daily, e.g. 5:00 AM)
 """
 
 import json
@@ -42,35 +42,28 @@ from sklearn.preprocessing import StandardScaler
 BASE_DIR = r"C:\Matlama"
 MODEL_DIR = os.path.join(BASE_DIR, "model")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
-STATE_FILE = os.path.join(MODEL_DIR, "last_train_state.json")
+STATE_FILE = os.path.join(MODEL_DIR, "hft_train_state.json")
 
-# MT5 sandbox Files path — updated to new terminal hash after OS reinstall
 MT5_SANDBOX_FILES = (
     r"C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal"
     r"\5A08E185CE336B177334803F286A1E5F\MQL5\Files"
 )
-# Renamed from hft_trades.csv — that filename collided with
-# MatlamaBridgeHFT.mq5, which was writing to the exact same file with a
-# different (incompatible) column meaning. Each strategy now has its own
-# CSV: bridgev3_trades.csv, hft_trades.csv, quant_trades.csv, scalper_trades.csv.
-TRADES_CSV = os.path.join(MT5_SANDBOX_FILES, "bridgev3_trades.csv")
+TRADES_CSV = os.path.join(MT5_SANDBOX_FILES, "hft_trades.csv")
 
 MIN_TRADES_TO_TRAIN = 50
 RETRAIN_INTERVAL_HOURS = 24
 
-# Feature columns matching actual CSV schema from MatlamaBridgeV3.
-# duration_min intentionally excluded — see note above.
-FEATURE_COLS = ["buy_score", "sell_score", "signal_score"]
+FEATURE_COLS = ["wick_pips", "momentum_pips", "volume_ratio", "rsi"]
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "ml_trainer.log"),
+    filename=os.path.join(LOG_DIR, "hft_engine.log"),
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("ml_trainer")
+logger = logging.getLogger("hft_engine")
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +87,8 @@ def load_trades():
         logger.error("No 'profit' column found in CSV — cannot derive result")
         return None
 
-    # Derive result from profit: win=1, loss=0
     df["result"] = (df["profit"] > 0).astype(int)
 
-    # Drop rows where feature cols are missing
     available_features = [c for c in FEATURE_COLS if c in df.columns]
     if len(available_features) < 2:
         logger.error("Not enough feature columns found. Available: %s", list(df.columns))
@@ -166,7 +157,6 @@ def train_model(df):
     X = df[available_features].fillna(0).values
     y = df["result"].values
 
-    # Need at least both classes to train
     if len(set(y)) < 2:
         raise ValueError("Only one class present in training data — need both wins and losses")
 
@@ -195,7 +185,6 @@ def train_model(df):
     logger.info("Test accuracy: %.3f", acc)
     logger.info("Classification report:\n%s", report)
 
-    # Store metadata on model object for threshold_server to read
     model.matlama_threshold_ = 0.55
     model.matlama_feature_names_ = available_features
     model.matlama_trained_at_ = datetime.utcnow().isoformat() + "Z"
@@ -209,7 +198,7 @@ def train_model(df):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    logger.info("=== ml_trainer.py started ===")
+    logger.info("=== hft_engine.py started ===")
 
     df = load_trades()
     if df is None or df.empty:
@@ -228,13 +217,13 @@ def main():
         logger.error("Training failed: %s", e)
         return
 
-    joblib.dump(model, os.path.join(MODEL_DIR, "rf_model.pkl"))
-    joblib.dump(scaler, os.path.join(MODEL_DIR, "scaler.pkl"))
+    joblib.dump(model, os.path.join(MODEL_DIR, "hft_model.pkl"))
+    joblib.dump(scaler, os.path.join(MODEL_DIR, "hft_scaler.pkl"))
     save_state(current_count)
 
     logger.info("Model saved. Trades=%d, Accuracy=%.3f, WinRate=%.1f%%",
                 current_count, acc, model.matlama_win_rate_ * 100)
-    logger.info("=== ml_trainer.py finished ===")
+    logger.info("=== hft_engine.py finished ===")
 
 
 if __name__ == "__main__":

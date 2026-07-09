@@ -470,6 +470,18 @@ void LogClosedTrades()
       double distance;
       double nearestFib = GetNearestFibLevel(closePrice, distance);
 
+      // Real velocity: pips moved over the last 3 M1 candles (this was
+      // previously mislabeled — the column was actually storing Fib
+      // distance, not velocity, since the two share a similar magnitude
+      // and the bug went unnoticed)
+      MqlRates velRates[]; ArraySetAsSeries(velRates, true);
+      double velocityPipsLog = 0;
+      if(CopyRates(_Symbol, PERIOD_M1, 0, 5, velRates) >= 5)
+      {
+         double pipSizeLog = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+         velocityPipsLog = (velRates[0].close - velRates[2].close) / pipSizeLog;
+      }
+
       // Get volume ratio
       long volBuf[];
       ArraySetAsSeries(volBuf, true);
@@ -503,10 +515,12 @@ void LogClosedTrades()
          DoubleToString(comm,   2),
          (string)durationMin,
          DoubleToString(nearestFib, 2),
-         DoubleToString(distance,   2),
+         DoubleToString(velocityPipsLog, 2),
          DoubleToString(volRatio,   2),
          DoubleToString(rsiAccel,   4),
-         "5"  // all 5 layers confirmed at entry
+         "5"  // full-override trades are orchestrator-authorized, not layer-gated;
+              // this "5" is a historical placeholder matching the old all-5-confirmed
+              // convention and should be revisited once enough post-override trades exist
       );
 
       lastLoggedTicket = ticket;
@@ -514,7 +528,7 @@ void LogClosedTrades()
 
       // Feed result back into the orchestrator's trade memory
       int winFlag = (profit > 0) ? 1 : 0;
-      OrchReportTrade(ORCH_REPORT, LastRegime, winFlag, profit);
+      OrchReportTrade(ORCH_REPORT, "QUANT", LastRegime, winFlag, profit);
    }
 
    FileClose(handle);
@@ -686,10 +700,57 @@ void OnTick()
 
    int newsRisk = 0; // wire to a news calendar feed if/when available
 
-   string payload = OrchBuildPayload(price, spread, atr, adx, volatility, momentum,
+   // Live, non-gating computation of Quant's own strategy features. These
+   // no longer gate entry (orchestrator is authoritative), but the
+   // orchestrator's dedicated QUANT model was trained on exactly these
+   // features, so they must be supplied for a meaningful prediction.
+   double distanceFib;
+   double nearestFibLevel = GetNearestFibLevel(price, distanceFib);
+   string dirGuess = (price < nearestFibLevel) ? "BUY" : "SELL";
+
+   MqlRates fRates[]; ArraySetAsSeries(fRates, true);
+   double velocityPips = 0;
+   if(CopyRates(_Symbol, PERIOD_M1, 0, 5, fRates) >= 5)
+   {
+      double pipSizeV = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+      if(dirGuess == "BUY") velocityPips = (fRates[0].close - fRates[2].close) / pipSizeV;
+      else                  velocityPips = (fRates[2].close - fRates[0].close) / pipSizeV;
+   }
+
+   long volBuf3[]; ArraySetAsSeries(volBuf3, true);
+   double volRatioLive = 0;
+   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, VolumePeriod + 1, volBuf3) >= VolumePeriod + 1)
+   {
+      double avgVolLive = 0;
+      for(int k = 1; k <= VolumePeriod; k++) avgVolLive += (double)volBuf3[k];
+      avgVolLive /= VolumePeriod;
+      volRatioLive = (double)volBuf3[0] / avgVolLive;
+   }
+
+   double rsiAccelLive = 0;
+   double rsiBuf3[]; ArraySetAsSeries(rsiBuf3, true);
+   if(CopyBuffer(rsiHandle, 0, 0, 3, rsiBuf3) >= 3)
+      rsiAccelLive = (rsiBuf3[0] - rsiBuf3[1]) - (rsiBuf3[1] - rsiBuf3[2]);
+
+   // Count how many of the 5 original layers currently pass, purely as a
+   // feature value — no gating, since the orchestrator decides.
+   int confirmedLayers = 0;
+   if(distanceFib <= FibProximity)             confirmedLayers++;
+   if(CheckVelocity(dirGuess))                 confirmedLayers++;
+   if(CheckVolumeSurge())                      confirmedLayers++;
+   if(CheckFibBreak(nearestFibLevel, dirGuess)) confirmedLayers++;
+   if(CheckMomentumAcceleration(dirGuess))      confirmedLayers++;
+
+   string extraFields = "\"fib_level\":" + DoubleToString(nearestFibLevel, 2) +
+                         ",\"velocity\":" + DoubleToString(velocityPips, 2) +
+                         ",\"volume_ratio\":" + DoubleToString(volRatioLive, 2) +
+                         ",\"rsi_accel\":" + DoubleToString(rsiAccelLive, 4) +
+                         ",\"signal_score\":" + (string)confirmedLayers;
+
+   string payload = OrchBuildPayload("QUANT", price, spread, atr, adx, volatility, momentum,
                                       volume, rsi, emaFast, emaSlow, newsRisk,
                                       MaxSpreadPips, AllowNewsTrading, AllowCrisisTrading,
-                                      MaxAccountDrawdownPct);
+                                      MaxAccountDrawdownPct, extraFields);
 
    OrchDecision dec = OrchGetDecision(ORCH_SERVER, payload);
 
