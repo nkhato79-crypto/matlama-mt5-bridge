@@ -236,9 +236,17 @@ bool CheckVelocity(string direction)
 //+------------------------------------------------------------------+
 bool CheckVolumeSurge()
 {
+   // Was PERIOD_M1 while every other layer (RSI, MACD, ADX, ATR, EMA,
+   // Sweep, FVG) runs on PERIOD_M5 — meant Volume was evaluating a
+   // different, faster-refreshing clock than the rest of the system.
+   // On any given tick, an M1 candle could have just opened seconds ago
+   // (low volume so far -> ratio fails) while the M5 RSI/MACD reading
+   // reflected several minutes of established move (already oversold /
+   // trending) — a real mismatch between layers, not noise. Aligned to
+   // M5 so every layer describes the same slice of time.
    long volBuf[];
    ArraySetAsSeries(volBuf, true);
-   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, VolumePeriod + 1, volBuf) < VolumePeriod + 1)
+   if(CopyTickVolume(_Symbol, PERIOD_M5, 0, VolumePeriod + 1, volBuf) < VolumePeriod + 1)
       return false;
 
    double avgVol = 0;
@@ -952,7 +960,11 @@ void OnTick()
 
    long volBuf3[]; ArraySetAsSeries(volBuf3, true);
    double volRatioLive = 0;
-   if(CopyTickVolume(_Symbol, PERIOD_M1, 0, VolumePeriod + 1, volBuf3) >= VolumePeriod + 1)
+   // Aligned to M5 to match CheckVolumeSurge's gate (Layer 3) — this value
+   // is reported to the orchestrator as "volume_ratio" and the QUANT model
+   // was trained expecting it to describe the same timeframe as everything
+   // else, not a faster M1 reading under the same feature name.
+   if(CopyTickVolume(_Symbol, PERIOD_M5, 0, VolumePeriod + 1, volBuf3) >= VolumePeriod + 1)
    {
       double avgVolLive = 0;
       for(int k = 1; k <= VolumePeriod; k++) avgVolLive += (double)volBuf3[k];
