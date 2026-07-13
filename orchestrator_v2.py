@@ -217,7 +217,15 @@ def score_model(model, scaler, features, order):
 # =========================================================
 # ADAPTIVE THRESHOLD (per-strategy, since each has its own memory)
 # =========================================================
-BASE_THRESHOLD = 0.30  # minimum |score| required to authorize a trade
+# Per-strategy base threshold. QUANT was moderately loosened (0.30 -> 0.22)
+# on 2026-07-13 after adding Layer 6/7 (Sweep+FVG) to MatlamaQuant.mq5 —
+# the extra confluence layers provide independent confirmation, justifying
+# a lower ML confidence bar for QUANT specifically. Other strategies are
+# left at the original 0.30 baseline.
+BASE_THRESHOLDS = {
+    "QUANT": 0.22,
+}
+BASE_THRESHOLD_DEFAULT = 0.30
 
 
 def adaptive_threshold(regime, strategy):
@@ -226,6 +234,8 @@ def adaptive_threshold(regime, strategy):
     strategy) is poor, and falls when performance is strong. Also widens
     automatically during a losing streak, tightens on a winning streak.
     """
+    base = BASE_THRESHOLDS.get(strategy, BASE_THRESHOLD_DEFAULT)
+
     wr = memory.win_rate(regime=regime, strategy=strategy)
     dd = memory.drawdown_factor(strategy=strategy)
     streak = memory.streak(strategy=strategy)
@@ -239,7 +249,7 @@ def adaptive_threshold(regime, strategy):
     elif streak >= 3:
         streak_adjustment = -0.03
 
-    threshold = BASE_THRESHOLD + wr_adjustment + dd_adjustment + streak_adjustment
+    threshold = base + wr_adjustment + dd_adjustment + streak_adjustment
     return float(np.clip(threshold, 0.15, 0.75))
 
 
