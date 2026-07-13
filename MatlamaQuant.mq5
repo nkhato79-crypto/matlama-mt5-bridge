@@ -59,6 +59,14 @@ input bool     AllowNewsTrading       = false;
 input bool     AllowCrisisTrading     = false;
 input double   MaxAccountDrawdownPct  = 0.20;
 
+//--- Layer 6/7 — Liquidity Sweep + FVG (OR-path override when ORCH says HOLD)
+input bool     EnableSweepFVG          = true;   // allow Sweep+FVG to fire trades ORCH declined
+input int      SweepLookback           = 30;     // M5 candles to establish the reference swing range
+input double   SweepMinPips            = 5.0;    // min pips beyond swing level to count as a sweep
+input int      FVG_Lookback            = 30;     // M5 candles to scan for unfilled FVGs
+input double   FVG_MinGapPips          = 3.0;    // minimum FVG size in pips to be tradeable
+input double   SweepFVG_SL_BufferPips  = 8.0;    // SL buffer beyond the sweep level for override trades
+
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck      = 0;
@@ -325,6 +333,194 @@ bool CheckMomentumAcceleration(string direction)
    Print("Layer 5 ✓ | Momentum accelerating | RSI accel: ",
          DoubleToString(rsiAccel, 3), " | MACD expanding");
    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Layer 6 — Liquidity Sweep Check                                  |
+//| Detects a wick-based stop hunt: price pierces a recent swing     |
+//| high/low by SweepMinPips then closes back inside the range —     |
+//| the classic liquidity-grab signature that precedes a reversal.   |
+//+------------------------------------------------------------------+
+bool CheckLiquiditySweep(string &direction, double &sweepLevel)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int need = SweepLookback + 5;
+   if(CopyRates(_Symbol, PERIOD_M5, 0, need, rates) < need) return false;
+
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double buffer  = SweepMinPips * pipSize;
+
+   // Reference swing range from bars further back (excludes the most
+   // recent candles, which are the ones we check for the actual sweep).
+   double refHigh = rates[5].high;
+   double refLow  = rates[5].low;
+   for(int i = 6; i < need; i++)
+   {
+      if(rates[i].high > refHigh) refHigh = rates[i].high;
+      if(rates[i].low  < refLow)  refLow  = rates[i].low;
+   }
+
+   // Check the last 3 closed candles for a sweep-and-reclaim of that range.
+   for(int i = 1; i <= 3; i++)
+   {
+      // Bullish sweep: wick pierces below refLow, candle closes back above it.
+      if(rates[i].low < (refLow - buffer) && rates[i].close > refLow)
+      {
+         direction  = "BUY";
+         sweepLevel = refLow;
+         Print("Layer 6 ✓ | Bullish liquidity sweep | Low pierced ", refLow,
+               " by ", DoubleToString((refLow - rates[i].low) / pipSize, 1),
+               " pips, closed back above at ", rates[i].close);
+         return true;
+      }
+      // Bearish sweep: wick pierces above refHigh, candle closes back below it.
+      if(rates[i].high > (refHigh + buffer) && rates[i].close < refHigh)
+      {
+         direction  = "SELL";
+         sweepLevel = refHigh;
+         Print("Layer 6 ✓ | Bearish liquidity sweep | High pierced ", refHigh,
+               " by ", DoubleToString((rates[i].high - refHigh) / pipSize, 1),
+               " pips, closed back below at ", rates[i].close);
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Layer 7 — Fair Value Gap (FVG) Check                             |
+//| Scans for an unfilled 3-candle imbalance and checks whether       |
+//| price is currently retesting into that gap. Single pass over     |
+//| FVG_Lookback bars — do not raise the lookback without profiling, |
+//| the fill-check below is O(n) per candidate gap.                  |
+//+------------------------------------------------------------------+
+bool CheckFairValueGap(string direction, double &gapTop, double &gapBottom)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int need = FVG_Lookback + 3;
+   if(CopyRates(_Symbol, PERIOD_M5, 0, need, rates) < need) return false;
+
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double minGap  = FVG_MinGapPips * pipSize;
+   double price   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // rates[i+2] = oldest (A), rates[i+1] = middle (B, impulse), rates[i] = newest (C)
+   // Scan from most recent gaps backward so we find the freshest unfilled one first.
+   for(int i = 1; i <= FVG_Lookback; i++)
+   {
+      int a = i + 2, c = i;
+      if(a >= need) break;
+
+      if(direction == "BUY")
+      {
+         // Bullish FVG: candle A's high sits below candle C's low.
+         double top    = rates[c].low;
+         double bottom = rates[a].high;
+         if(top - bottom < minGap) continue;
+
+         // Unfilled check: no candle between formation and now has traded
+         // all the way through the gap (closed below the gap's bottom).
+         bool filled = false;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].low <= bottom) { filled = true; break; }
+         }
+         if(filled) continue;
+
+         // Retest in progress: current price sitting inside the gap.
+         if(price >= bottom && price <= top)
+         {
+            gapTop    = top;
+            gapBottom = bottom;
+            Print("Layer 7 ✓ | Bullish FVG retest | Gap ", DoubleToString(bottom, 2),
+                  " - ", DoubleToString(top, 2), " | Price: ", price);
+            return true;
+         }
+      }
+      else // SELL
+      {
+         // Bearish FVG: candle A's low sits above candle C's high.
+         double top    = rates[a].low;
+         double bottom = rates[c].high;
+         if(top - bottom < minGap) continue;
+
+         bool filled = false;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].high >= top) { filled = true; break; }
+         }
+         if(filled) continue;
+
+         if(price >= bottom && price <= top)
+         {
+            gapTop    = top;
+            gapBottom = bottom;
+            Print("Layer 7 ✓ | Bearish FVG retest | Gap ", DoubleToString(bottom, 2),
+                  " - ", DoubleToString(top, 2), " | Price: ", price);
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Combined Layer 6+7 — OR-path override                            |
+//| Fires only when a liquidity sweep AND an unfilled FVG agree on    |
+//| the same direction, with price actively retesting the gap now.   |
+//+------------------------------------------------------------------+
+bool CheckLiquiditySweepFVG(string &direction, double &sweepLevel,
+                            double &gapTop, double &gapBottom)
+{
+   string sweepDir;
+   double level;
+   if(!CheckLiquiditySweep(sweepDir, level)) return false;
+
+   double top, bottom;
+   if(!CheckFairValueGap(sweepDir, top, bottom)) return false;
+
+   direction  = sweepDir;
+   sweepLevel = level;
+   gapTop     = top;
+   gapBottom  = bottom;
+
+   Print("=== LAYER 6+7 CONFLUENCE | Sweep + FVG agree on ", direction, " ===");
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Trade levels for a Sweep+FVG override entry.                     |
+//| SL anchors to the swept liquidity level (the level that must NOT |
+//| be re-broken for the trade thesis to remain valid), not the      |
+//| nearest Fib — Fib is irrelevant to this signal's own logic.      |
+//+------------------------------------------------------------------+
+void GetSweepFVGTradeLevels(string direction, double sweepLevel,
+                             double gapTop, double gapBottom, double currentPrice,
+                             double &sl, double &tp1, double &tp2, double &tp3)
+{
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double buffer  = SweepFVG_SL_BufferPips * pipSize;
+
+   if(direction == "BUY")
+   {
+      sl  = sweepLevel - buffer;
+      double risk = currentPrice - sl;
+      tp1 = currentPrice + 2.0 * risk;   // conservative 2R lock-in
+      tp2 = Fib236;                      // reuse existing Fib map for scale-out targets
+      tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
+   }
+   else
+   {
+      sl  = sweepLevel + buffer;
+      double risk = sl - currentPrice;
+      tp1 = currentPrice - 2.0 * risk;
+      tp2 = Ext127;
+      tp3 = Ext162;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -757,11 +953,20 @@ void OnTick()
    if(CheckFibBreak(nearestFibLevel, dirGuess)) confirmedLayers++;
    if(CheckMomentumAcceleration(dirGuess))      confirmedLayers++;
 
+   // Layer 6+7 features — computed every tick and reported to the orchestrator
+   // regardless of outcome, so future retrains can learn from sweep/FVG context
+   // even on ticks where the OR-path override below doesn't end up firing.
+   string sweepDirFeat = "";
+   double sweepLevelFeat = 0, gapTopFeat = 0, gapBottomFeat = 0;
+   bool sweepFvgFeat = CheckLiquiditySweepFVG(sweepDirFeat, sweepLevelFeat, gapTopFeat, gapBottomFeat);
+
    string extraFields = "\"fib_level\":" + DoubleToString(nearestFibLevel, 2) +
                          ",\"velocity\":" + DoubleToString(velocityPips, 2) +
                          ",\"volume_ratio\":" + DoubleToString(volRatioLive, 2) +
                          ",\"rsi_accel\":" + DoubleToString(rsiAccelLive, 4) +
-                         ",\"signal_score\":" + (string)confirmedLayers;
+                         ",\"signal_score\":" + (string)confirmedLayers +
+                         ",\"sweep_fvg_detected\":" + (sweepFvgFeat ? "1" : "0") +
+                         ",\"sweep_fvg_direction\":\"" + (sweepFvgFeat ? sweepDirFeat : "NONE") + "\"";
 
    string payload = OrchBuildPayload("QUANT", price, spread, atr, adx, volatility, momentum,
                                       volume, rsi, emaFast, emaSlow, newsRisk,
@@ -781,23 +986,58 @@ void OnTick()
 
    LastRegime = dec.regime;
 
+   bool   isOverride  = false;
+   double sweepLevel = 0, gapTop = 0, gapBottom = 0;
+
    if(dec.decision == "HOLD")
    {
-      Print("Signal: HOLD | Orchestrator declined the trade");
-      return;
+      // OR-path: orchestrator declined, but Layer 6+7 (Sweep+FVG) get an
+      // independent shot at the same tick. This exists specifically because
+      // the ML model wasn't trained on sweep/FVG features yet and was
+      // observed holding through clean textbook sweep+retest setups.
+      if(!EnableSweepFVG || !CheckLiquiditySweepFVG(direction, sweepLevel, gapTop, gapBottom))
+      {
+         Print("Signal: HOLD | Orchestrator declined, no Sweep+FVG override available");
+         return;
+      }
+      isOverride = true;
+      Print("=== SWEEP+FVG OVERRIDE | ORCH said HOLD, taking ", direction,
+            " on Layer 6+7 confluence ===");
+   }
+   else
+   {
+      direction = dec.decision; // "BUY" or "SELL" — orchestrator is authoritative
    }
 
-   direction = dec.decision; // "BUY" or "SELL" — orchestrator is authoritative
+   if(isOverride && !CheckDynamicSpread(sweepLevel))
+   {
+      // Reuse the existing dynamic spread guard for override trades too —
+      // the orchestrator path already applies its own spread check server-side,
+      // but the override path bypasses the orchestrator entirely so it needs
+      // this safety net applied locally. Distance is measured against the
+      // swept level itself, since that's the structural reference for this signal.
+      Print("Sweep+FVG override skipped | Spread too wide relative to structure");
+      return;
+   }
 
    double distance;
    nearestFib = GetNearestFibLevel(price, distance);
 
-   Print("=== ORCHESTRATOR SIGNAL | Direction: ", direction,
-         " | Confidence: ", DoubleToString(dec.confidence, 3), " ===");
+   if(isOverride)
+      Print("=== SWEEP+FVG SIGNAL | Direction: ", direction,
+            " | Sweep level: ", DoubleToString(sweepLevel, 2),
+            " | FVG: ", DoubleToString(gapBottom, 2), "-", DoubleToString(gapTop, 2), " ===");
+   else
+      Print("=== ORCHESTRATOR SIGNAL | Direction: ", direction,
+            " | Confidence: ", DoubleToString(dec.confidence, 3), " ===");
 
    double sl, tp1, tp2, tp3;
-   GetTradeLevels(direction, nearestFib, dec.regime, price, sl, tp1, tp2, tp3);
+   if(isOverride)
+      GetSweepFVGTradeLevels(direction, sweepLevel, gapTop, gapBottom, price, sl, tp1, tp2, tp3);
+   else
+      GetTradeLevels(direction, nearestFib, dec.regime, price, sl, tp1, tp2, tp3);
 
+   string tradeComment = isOverride ? "_SWEEPFVG" : "";
    bool success = false;
 
    if(direction == "BUY")
@@ -805,11 +1045,12 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
-      success = trade.Buy(LotSize, _Symbol, 0, sl, tp1, "MQ_BUY");
+      success = trade.Buy(LotSize, _Symbol, 0, sl, tp1, "MQ_BUY" + tradeComment);
       if(success)
       {
          Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib);
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
+               isOverride ? " | Source: SWEEP+FVG OVERRIDE" : " | Source: ORCH");
          EntryTime = TimeCurrent();
       }
       else Print("BUY failed: ", trade.ResultRetcodeDescription());
@@ -819,11 +1060,12 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
-      success = trade.Sell(LotSize, _Symbol, 0, sl, tp1, "MQ_SELL");
+      success = trade.Sell(LotSize, _Symbol, 0, sl, tp1, "MQ_SELL" + tradeComment);
       if(success)
       {
          Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib);
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
+               isOverride ? " | Source: SWEEP+FVG OVERRIDE" : " | Source: ORCH");
          EntryTime = TimeCurrent();
       }
       else Print("SELL failed: ", trade.ResultRetcodeDescription());
