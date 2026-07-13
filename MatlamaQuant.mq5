@@ -351,37 +351,58 @@ bool CheckLiquiditySweep(string &direction, double &sweepLevel)
    double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
    double buffer  = SweepMinPips * pipSize;
 
-   // Reference swing range from bars further back (excludes the most
-   // recent candles, which are the ones we check for the actual sweep).
-   double refHigh = rates[5].high;
-   double refLow  = rates[5].low;
-   for(int i = 6; i < need; i++)
+   // Reference swing range from the oldest portion of the lookback window.
+   double refHigh = rates[SweepLookback].high;
+   double refLow  = rates[SweepLookback].low;
+   for(int i = SweepLookback + 1; i < need; i++)
    {
       if(rates[i].high > refHigh) refHigh = rates[i].high;
       if(rates[i].low  < refLow)  refLow  = rates[i].low;
    }
 
-   // Check the last 3 closed candles for a sweep-and-reclaim of that range.
-   for(int i = 1; i <= 3; i++)
+   // Scan the FULL recent window (not just the last 3 bars) for a sweep-
+   // and-reclaim, most recent first. A sweep+FVG retest sequence takes
+   // several bars to fully develop (sweep -> reversal impulse -> FVG forms
+   // -> price pulls back to retest it), so the sweep itself needs to stay
+   // "remembered" for longer than just 3 bars for Layer 7 to ever have a
+   // chance to co-confirm on the same tick.
+   for(int i = 1; i < SweepLookback; i++)
    {
       // Bullish sweep: wick pierces below refLow, candle closes back above it.
       if(rates[i].low < (refLow - buffer) && rates[i].close > refLow)
       {
+         // Only valid if no bar since (more recent than i) has closed back
+         // below the swept low — that would mean the level actually broke
+         // rather than held, invalidating the sweep thesis.
+         bool invalidated = false;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].close < refLow) { invalidated = true; break; }
+         }
+         if(invalidated) continue;
+
          direction  = "BUY";
          sweepLevel = refLow;
          Print("Layer 6 ✓ | Bullish liquidity sweep | Low pierced ", refLow,
                " by ", DoubleToString((refLow - rates[i].low) / pipSize, 1),
-               " pips, closed back above at ", rates[i].close);
+               " pips, ", i, " bars ago, still unmitigated");
          return true;
       }
       // Bearish sweep: wick pierces above refHigh, candle closes back below it.
       if(rates[i].high > (refHigh + buffer) && rates[i].close < refHigh)
       {
+         bool invalidated = false;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].close > refHigh) { invalidated = true; break; }
+         }
+         if(invalidated) continue;
+
          direction  = "SELL";
          sweepLevel = refHigh;
          Print("Layer 6 ✓ | Bearish liquidity sweep | High pierced ", refHigh,
                " by ", DoubleToString((rates[i].high - refHigh) / pipSize, 1),
-               " pips, closed back below at ", rates[i].close);
+               " pips, ", i, " bars ago, still unmitigated");
          return true;
       }
    }
