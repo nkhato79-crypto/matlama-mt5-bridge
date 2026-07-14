@@ -66,6 +66,9 @@ input double   SweepMinPips            = 5.0;    // min pips beyond swing level 
 input int      FVG_Lookback            = 30;     // M5 candles to scan for unfilled FVGs
 input double   FVG_MinGapPips          = 3.0;    // minimum FVG size in pips to be tradeable
 input double   SweepFVG_SL_BufferPips  = 8.0;    // SL buffer beyond the sweep level for override trades
+input bool     EnableContinuation      = true;   // allow sweep + fresh (unretested) FVG to fire a continuation entry
+input int      ContinuationFVGMaxAge   = 5;      // max bars since FVG formed to still count as "fresh"
+input double   ContinuationSL_BufferPips = 5.0;  // SL buffer beyond the fresh FVG's near edge
 
 //--- Global Variables
 CTrade   trade;
@@ -553,6 +556,134 @@ void GetSweepFVGTradeLevels(string direction, double sweepLevel,
 }
 
 //+------------------------------------------------------------------+
+//| Layer 7b — Fresh (unretested) FVG check for continuation entries |
+//| Unlike CheckFairValueGap (which requires price to be sitting     |
+//| INSIDE the gap right now — a retest), this checks whether a      |
+//| qualifying unfilled FVG recently FORMED in the given direction,  |
+//| regardless of where price currently sits relative to it. A       |
+//| fresh, unfilled gap is itself evidence the impulse leg had real  |
+//| conviction — useful for riding a continuation move that never    |
+//| pulls back far enough to retest.                                 |
+//+------------------------------------------------------------------+
+bool CheckFreshFVG(string direction, double &gapTop, double &gapBottom, int &barsAgo)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int need = FVG_Lookback + 3;
+   if(CopyRates(_Symbol, PERIOD_M5, 0, need, rates) < need) return false;
+
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double minGap  = FVG_MinGapPips * pipSize;
+
+   for(int i = 1; i <= ContinuationFVGMaxAge; i++)
+   {
+      int a = i + 2, c = i;
+      if(a >= need) break;
+
+      if(direction == "BUY")
+      {
+         double top    = rates[c].low;
+         double bottom = rates[a].high;
+         if(top - bottom < minGap) continue;
+
+         bool filled = false;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].low <= bottom) { filled = true; break; }
+         }
+         if(filled) continue;
+
+         gapTop = top; gapBottom = bottom; barsAgo = i;
+         Print("Layer 7b ✓ | Fresh bullish FVG (unretested) | Gap ",
+               DoubleToString(bottom, 2), " - ", DoubleToString(top, 2),
+               " | Formed ", i, " bars ago");
+         return true;
+      }
+      else // SELL
+      {
+         double top    = rates[a].low;
+         double bottom = rates[c].high;
+         if(top - bottom < minGap) continue;
+
+         bool filled = false;
+         for(int j = i - 1; j >= 0; j--)
+         {
+            if(rates[j].high >= top) { filled = true; break; }
+         }
+         if(filled) continue;
+
+         gapTop = top; gapBottom = bottom; barsAgo = i;
+         Print("Layer 7b ✓ | Fresh bearish FVG (unretested) | Gap ",
+               DoubleToString(bottom, 2), " - ", DoubleToString(top, 2),
+               " | Formed ", i, " bars ago");
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Combined — Sweep + Continuation (no retest required)              |
+//| Complements CheckLiquiditySweepFVG: that function catches the     |
+//| mean-reversion case (pullback into an existing gap); this one     |
+//| catches a move that just keeps going, confirmed by the fact that  |
+//| it's leaving fresh, unfilled imbalance behind it as it goes.      |
+//+------------------------------------------------------------------+
+bool CheckSweepContinuation(string &direction, double &sweepLevel,
+                            double &gapTop, double &gapBottom, int &fvgBarsAgo)
+{
+   string sweepDir;
+   double level;
+   if(!CheckLiquiditySweep(sweepDir, level)) return false;
+
+   double top, bottom;
+   int barsAgo;
+   if(!CheckFreshFVG(sweepDir, top, bottom, barsAgo)) return false;
+
+   direction  = sweepDir;
+   sweepLevel = level;
+   gapTop     = top;
+   gapBottom  = bottom;
+   fvgBarsAgo = barsAgo;
+
+   Print("=== SWEEP + CONTINUATION | Sweep confirmed, fresh FVG (",
+         barsAgo, " bars old) confirms momentum in ", direction, " ===");
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Trade levels for a continuation entry.                           |
+//| SL anchors to the fresh FVG's near edge — the gap being filled    |
+//| back through is the signal the impulse has failed, not the       |
+//| original (now distant) swept level.                              |
+//+------------------------------------------------------------------+
+void GetContinuationTradeLevels(string direction, double gapTop, double gapBottom,
+                                 double currentPrice, double &sl, double &tp1,
+                                 double &tp2, double &tp3)
+{
+   double pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double buffer  = ContinuationSL_BufferPips * pipSize;
+
+   if(direction == "BUY")
+   {
+      sl  = gapBottom - buffer;   // near edge of the fresh gap
+      double risk = currentPrice - sl;
+      tp1 = currentPrice + 1.5 * risk;   // tighter target — chasing, not at a discount
+      tp2 = SwingHigh;
+      tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
+   }
+   else
+   {
+      sl  = gapTop + buffer;
+      double risk = sl - currentPrice;
+      tp1 = currentPrice - 1.5 * risk;
+      tp2 = SwingLow;
+      tp3 = SwingLow - (SwingHigh - SwingLow) * 0.272;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Dynamic spread check relative to nearest Fib distance            |
 //+------------------------------------------------------------------+
 bool CheckDynamicSpread(double nearestFib)
@@ -1019,23 +1150,38 @@ void OnTick()
 
    LastRegime = dec.regime;
 
-   bool   isOverride  = false;
+   bool   isOverride    = false;
+   string overrideMode  = "";   // "RETEST" or "CONTINUATION"
    double sweepLevel = 0, gapTop = 0, gapBottom = 0;
+   int    fvgBarsAgo = 0;
 
    if(dec.decision == "HOLD")
    {
-      // OR-path: orchestrator declined, but Layer 6+7 (Sweep+FVG) get an
-      // independent shot at the same tick. This exists specifically because
-      // the ML model wasn't trained on sweep/FVG features yet and was
-      // observed holding through clean textbook sweep+retest setups.
-      if(!EnableSweepFVG || !CheckLiquiditySweepFVG(direction, sweepLevel, gapTop, gapBottom))
+      // OR-path #1: retest — Layer 6+7 as originally built. Catches a
+      // sweep followed by a pullback into the FVG left on the reversal.
+      if(EnableSweepFVG && CheckLiquiditySweepFVG(direction, sweepLevel, gapTop, gapBottom))
       {
-         Print("Signal: HOLD | Orchestrator declined, no Sweep+FVG override available");
+         isOverride   = true;
+         overrideMode = "RETEST";
+         Print("=== SWEEP+FVG RETEST OVERRIDE | ORCH said HOLD, taking ", direction,
+               " on Layer 6+7 confluence ===");
+      }
+      // OR-path #2: continuation — sweep confirmed, but instead of waiting
+      // for a pullback that may never come, a fresh unfilled FVG in the
+      // same direction confirms the impulse itself has conviction, so we
+      // ride the move rather than only ever catching mean-reversions.
+      else if(EnableContinuation && CheckSweepContinuation(direction, sweepLevel, gapTop, gapBottom, fvgBarsAgo))
+      {
+         isOverride   = true;
+         overrideMode = "CONTINUATION";
+         Print("=== SWEEP+CONTINUATION OVERRIDE | ORCH said HOLD, taking ", direction,
+               " on sweep + fresh FVG (no retest required) ===");
+      }
+      else
+      {
+         Print("Signal: HOLD | Orchestrator declined, no Sweep+FVG override available (retest or continuation)");
          return;
       }
-      isOverride = true;
-      Print("=== SWEEP+FVG OVERRIDE | ORCH said HOLD, taking ", direction,
-            " on Layer 6+7 confluence ===");
    }
    else
    {
@@ -1049,7 +1195,7 @@ void OnTick()
       // but the override path bypasses the orchestrator entirely so it needs
       // this safety net applied locally. Distance is measured against the
       // swept level itself, since that's the structural reference for this signal.
-      Print("Sweep+FVG override skipped | Spread too wide relative to structure");
+      Print(overrideMode, " override skipped | Spread too wide relative to structure");
       return;
    }
 
@@ -1057,7 +1203,7 @@ void OnTick()
    nearestFib = GetNearestFibLevel(price, distance);
 
    if(isOverride)
-      Print("=== SWEEP+FVG SIGNAL | Direction: ", direction,
+      Print("=== ", overrideMode, " SIGNAL | Direction: ", direction,
             " | Sweep level: ", DoubleToString(sweepLevel, 2),
             " | FVG: ", DoubleToString(gapBottom, 2), "-", DoubleToString(gapTop, 2), " ===");
    else
@@ -1065,12 +1211,18 @@ void OnTick()
             " | Confidence: ", DoubleToString(dec.confidence, 3), " ===");
 
    double sl, tp1, tp2, tp3;
-   if(isOverride)
+   if(overrideMode == "RETEST")
       GetSweepFVGTradeLevels(direction, sweepLevel, gapTop, gapBottom, price, sl, tp1, tp2, tp3);
+   else if(overrideMode == "CONTINUATION")
+      GetContinuationTradeLevels(direction, gapTop, gapBottom, price, sl, tp1, tp2, tp3);
    else
       GetTradeLevels(direction, nearestFib, dec.regime, price, sl, tp1, tp2, tp3);
 
-   string tradeComment = isOverride ? "_SWEEPFVG" : "";
+   string tradeComment = "";
+   if(overrideMode == "RETEST")       tradeComment = "_SWEEPFVG";
+   else if(overrideMode == "CONTINUATION") tradeComment = "_SWEEPCONT";
+
+   string sourceTag = isOverride ? (" | Source: " + overrideMode + " OVERRIDE") : " | Source: ORCH";
    bool success = false;
 
    if(direction == "BUY")
@@ -1082,8 +1234,7 @@ void OnTick()
       if(success)
       {
          Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
-               isOverride ? " | Source: SWEEP+FVG OVERRIDE" : " | Source: ORCH");
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib, sourceTag);
          EntryTime = TimeCurrent();
       }
       else Print("BUY failed: ", trade.ResultRetcodeDescription());
@@ -1097,8 +1248,7 @@ void OnTick()
       if(success)
       {
          Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
-               isOverride ? " | Source: SWEEP+FVG OVERRIDE" : " | Source: ORCH");
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib, sourceTag);
          EntryTime = TimeCurrent();
       }
       else Print("SELL failed: ", trade.ResultRetcodeDescription());
