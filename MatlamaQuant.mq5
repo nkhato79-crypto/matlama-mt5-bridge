@@ -773,6 +773,13 @@ void InitCSV()
       }
    }
    else FileClose(handle);
+
+   // Restore lastLoggedTicket across recompiles/reattaches/terminal restarts.
+   // Without this, the global resets to 0 on every EA reinit and
+   // LogClosedTrades() re-appends already-logged closed trades as duplicates.
+   string gvName = "Quant_LastLoggedTicket_" + _Symbol + "_" + (string)MagicNumber;
+   if(GlobalVariableCheck(gvName))
+      lastLoggedTicket = (ulong)GlobalVariableGet(gvName);
 }
 
 //+------------------------------------------------------------------+
@@ -896,6 +903,7 @@ void LogClosedTrades()
       );
 
       lastLoggedTicket = ticket;
+      GlobalVariableSet("Quant_LastLoggedTicket_" + _Symbol + "_" + (string)MagicNumber, (double)lastLoggedTicket);
       Print("Quant trade logged | Ticket:", ticket, " Profit:", profit);
 
       // Feed result back into the orchestrator's trade memory
