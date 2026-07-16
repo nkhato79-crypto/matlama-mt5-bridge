@@ -2,14 +2,14 @@
 //|                                              MatlamaORB.mq5      |
 //|                                          Matlama Tech 2026       |
 //+------------------------------------------------------------------+
-//|  Standalone Opening Range Breakout strategy.                     |
+//|  Standalone Opening Range Breakout strategy — London + NY.       |
 //|  Deliberately NOT wired to orchestrator_v2 (no ML scoring —      |
 //|  ORB logic is deterministic rule-based, nothing to learn).       |
 //|  Protection from high-impact news still comes from               |
 //|  MatlamaFundamentals via CloseByMagic(MagicORB).                 |
 //+------------------------------------------------------------------+
 #property copyright "Matlama Tech 2026"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -17,55 +17,76 @@ CTrade trade;
 
 //--- Identity
 input int    MagicORB          = 20260301;   // Unique magic number for this EA
-input string EA_Name           = "MatlamaORB v1";
+input string EA_Name           = "MatlamaORB v2";
 
-//--- Session / range settings (all times UTC)
-input int    SessionStartHour  = 8;          // Session open hour (e.g. 8 = London open)
-input int    SessionStartMin   = 0;
-input int    RangeWindowMins   = 30;         // Length of the opening range window
+//--- Session 0 = London, Session 1 = NY. All times UTC.
+input int    LondonStartHour   = 8;
+input int    LondonStartMin    = 0;
+input int    NYStartHour       = 13;
+input int    NYStartMin        = 30;
+input int    RangeWindowMins   = 30;         // Length of the opening range window (both sessions)
 input int    BreakoutValidMins = 180;        // How long after range closes a breakout is still valid
 
 //--- Risk settings
 input double LotSize           = 0.01;
 input double SLBufferPips      = 5.0;        // Extra buffer beyond range boundary for SL
 input double RR_Multiple       = 2.0;        // TP = range size * this multiple
-input int    MaxTradesPerDay   = 2;          // 1 long + 1 short max, per session
+input int    MaxTradesPerDay   = 4;          // Across both sessions combined (2 sessions x long/short)
 
 //--- CSV logging
 string   CSV_PATH = "orb_trades.csv";
 ulong    lastLoggedTicket = 0;
 
-//--- Internal state (reset daily)
-datetime rangeDayStamp   = 0;   // which trading day the current range belongs to
-datetime rangeStartTime  = 0;
-datetime rangeEndTime    = 0;
-double   rangeHigh       = 0;
-double   rangeLow        = 0;
-bool     rangeLocked     = false;   // true once the window has closed and range is final
-bool     longTaken       = false;
-bool     shortTaken      = false;
+//--- Per-session state, index 0 = London, index 1 = NY
+datetime rangeDayStamp[2];
+datetime rangeStartTime[2];
+datetime rangeEndTime[2];
+double   rangeHigh[2];
+double   rangeLow[2];
+bool     rangeLocked[2];
+bool     longTaken[2];
+bool     shortTaken[2];
+string   sessionLabel[2];
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   sessionLabel[0] = "LONDON";
+   sessionLabel[1] = "NY";
+
    InitCSV();
-   string gvHigh = "ORB_RangeHigh_" + _Symbol + "_" + (string)MagicORB;
-   string gvLow  = "ORB_RangeLow_"  + _Symbol + "_" + (string)MagicORB;
-   string gvDay  = "ORB_RangeDay_"  + _Symbol + "_" + (string)MagicORB;
-   // Restore today's range across recompiles/restarts so we don't miss a breakout
-   // that's already in progress when the EA reinitializes mid-session.
-   if(GlobalVariableCheck(gvDay))
+
+   for(int s = 0; s < 2; s++)
    {
-      rangeDayStamp = (datetime)GlobalVariableGet(gvDay);
-      if(IsSameTradingDay(rangeDayStamp, TimeGMT()))
+      rangeDayStamp[s] = 0;
+      rangeHigh[s]     = 0;
+      rangeLow[s]      = 0;
+      rangeLocked[s]   = false;
+      longTaken[s]     = false;
+      shortTaken[s]    = false;
+
+      // Restore today's range across recompiles/restarts so we don't miss
+      // a breakout already in progress when the EA reinitializes mid-session.
+      string gvHigh = "ORB_RangeHigh_" + sessionLabel[s] + "_" + _Symbol + "_" + (string)MagicORB;
+      string gvLow  = "ORB_RangeLow_"  + sessionLabel[s] + "_" + _Symbol + "_" + (string)MagicORB;
+      string gvDay  = "ORB_RangeDay_"  + sessionLabel[s] + "_" + _Symbol + "_" + (string)MagicORB;
+      if(GlobalVariableCheck(gvDay))
       {
-         rangeHigh = GlobalVariableGet(gvHigh);
-         rangeLow  = GlobalVariableGet(gvLow);
-         rangeLocked = (rangeHigh > 0 && rangeLow > 0);
+         datetime savedDay = (datetime)GlobalVariableGet(gvDay);
+         if(IsSameTradingDay(savedDay, TimeGMT()))
+         {
+            rangeDayStamp[s] = savedDay;
+            rangeHigh[s] = GlobalVariableGet(gvHigh);
+            rangeLow[s]  = GlobalVariableGet(gvLow);
+            rangeLocked[s] = (rangeHigh[s] > 0 && rangeLow[s] > 0);
+         }
       }
    }
-   Print(EA_Name, " initialized | Magic:", MagicORB, " | Session start (UTC): ",
-         SessionStartHour, ":", SessionStartMin, " | Window:", RangeWindowMins, "min");
+
+   Print(EA_Name, " initialized | Magic:", MagicORB,
+         " | London ", LondonStartHour, ":", LondonStartMin,
+         " | NY ", NYStartHour, ":", NYStartMin,
+         " | Window:", RangeWindowMins, "min");
    return(INIT_SUCCEEDED);
 }
 
@@ -85,105 +106,99 @@ bool IsSameTradingDay(datetime a, datetime b)
 }
 
 //+------------------------------------------------------------------+
-void ResetDailyStateIfNeeded()
+void ResetDailyStateIfNeeded(int s, int startHour, int startMin)
 {
    datetime now = TimeGMT();
-   if(rangeDayStamp == 0 || !IsSameTradingDay(rangeDayStamp, now))
+   if(rangeDayStamp[s] == 0 || !IsSameTradingDay(rangeDayStamp[s], now))
    {
-      rangeDayStamp = now;
-      rangeHigh     = 0;
-      rangeLow      = 0;
-      rangeLocked   = false;
-      longTaken     = false;
-      shortTaken    = false;
+      rangeDayStamp[s] = now;
+      rangeHigh[s]     = 0;
+      rangeLow[s]      = 0;
+      rangeLocked[s]   = false;
+      longTaken[s]     = false;
+      shortTaken[s]    = false;
 
       MqlDateTime dt;
       TimeToStruct(now, dt);
-      dt.hour = SessionStartHour;
-      dt.min  = SessionStartMin;
+      dt.hour = startHour;
+      dt.min  = startMin;
       dt.sec  = 0;
-      rangeStartTime = StructToTime(dt);
-      rangeEndTime   = rangeStartTime + RangeWindowMins * 60;
+      rangeStartTime[s] = StructToTime(dt);
+      rangeEndTime[s]   = rangeStartTime[s] + RangeWindowMins * 60;
    }
 }
 
 //+------------------------------------------------------------------+
-void BuildOpeningRange()
+void BuildOpeningRange(int s)
 {
    datetime now = TimeGMT();
-   if(now < rangeStartTime || rangeLocked) return;
+   if(now < rangeStartTime[s] || rangeLocked[s]) return;
 
-   // While inside the window: keep expanding high/low from H1... use a finer
-   // timeframe internally for accuracy regardless of chart timeframe.
-   if(now <= rangeEndTime)
+   if(now <= rangeEndTime[s])
    {
-      int bars = Bars(_Symbol, PERIOD_M1, rangeStartTime, now);
+      int bars = Bars(_Symbol, PERIOD_M1, rangeStartTime[s], now);
       if(bars <= 0) return;
       double hi = iHigh(_Symbol, PERIOD_M1, iHighest(_Symbol, PERIOD_M1, MODE_HIGH, bars, 0));
       double lo = iLow(_Symbol, PERIOD_M1, iLowest(_Symbol, PERIOD_M1, MODE_LOW, bars, 0));
-      if(hi > rangeHigh) rangeHigh = hi;
-      if(rangeLow == 0 || lo < rangeLow) rangeLow = lo;
+      if(hi > rangeHigh[s]) rangeHigh[s] = hi;
+      if(rangeLow[s] == 0 || lo < rangeLow[s]) rangeLow[s] = lo;
    }
    else
    {
-      // Window just closed — lock the range and persist it
-      rangeLocked = true;
-      string gvHigh = "ORB_RangeHigh_" + _Symbol + "_" + (string)MagicORB;
-      string gvLow  = "ORB_RangeLow_"  + _Symbol + "_" + (string)MagicORB;
-      string gvDay  = "ORB_RangeDay_"  + _Symbol + "_" + (string)MagicORB;
-      GlobalVariableSet(gvHigh, rangeHigh);
-      GlobalVariableSet(gvLow, rangeLow);
-      GlobalVariableSet(gvDay, (double)rangeDayStamp);
-      Print(EA_Name, " | Range locked | High:", rangeHigh, " Low:", rangeLow,
-            " Size:", (rangeHigh - rangeLow));
+      rangeLocked[s] = true;
+      string gvHigh = "ORB_RangeHigh_" + sessionLabel[s] + "_" + _Symbol + "_" + (string)MagicORB;
+      string gvLow  = "ORB_RangeLow_"  + sessionLabel[s] + "_" + _Symbol + "_" + (string)MagicORB;
+      string gvDay  = "ORB_RangeDay_"  + sessionLabel[s] + "_" + _Symbol + "_" + (string)MagicORB;
+      GlobalVariableSet(gvHigh, rangeHigh[s]);
+      GlobalVariableSet(gvLow, rangeLow[s]);
+      GlobalVariableSet(gvDay, (double)rangeDayStamp[s]);
+      Print(EA_Name, " | ", sessionLabel[s], " range locked | High:", rangeHigh[s],
+            " Low:", rangeLow[s], " Size:", (rangeHigh[s] - rangeLow[s]));
    }
 }
 
 //+------------------------------------------------------------------+
-bool WithinBreakoutWindow()
+bool WithinBreakoutWindow(int s)
 {
    datetime now = TimeGMT();
-   return(rangeLocked && now > rangeEndTime && now <= rangeEndTime + BreakoutValidMins * 60);
+   return(rangeLocked[s] && now > rangeEndTime[s] && now <= rangeEndTime[s] + BreakoutValidMins * 60);
 }
 
 //+------------------------------------------------------------------+
-void CheckBreakoutEntries()
+void CheckBreakoutEntries(int s)
 {
-   if(!WithinBreakoutWindow()) return;
-   if(rangeHigh <= 0 || rangeLow <= 0) return;
+   if(!WithinBreakoutWindow(s)) return;
+   if(rangeHigh[s] <= 0 || rangeLow[s] <= 0) return;
 
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double buffer  = SLBufferPips * point * 10; // rough pip->price buffer, gold-appropriate
-   double rangeSize = rangeHigh - rangeLow;
+   double buffer  = SLBufferPips * point * 10;
+   double rangeSize = rangeHigh[s] - rangeLow[s];
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   int totalToday = CountTradesToday();
-   if(totalToday >= MaxTradesPerDay) return;
+   if(CountTradesToday() >= MaxTradesPerDay) return;
 
-   // Long breakout
-   if(!longTaken && ask > rangeHigh)
+   if(!longTaken[s] && ask > rangeHigh[s])
    {
-      double sl = rangeLow - buffer;
+      double sl = rangeLow[s] - buffer;
       double tp = ask + (rangeSize * RR_Multiple);
       trade.SetExpertMagicNumber(MagicORB);
-      if(trade.Buy(LotSize, _Symbol, ask, sl, tp, EA_Name + " long breakout"))
+      if(trade.Buy(LotSize, _Symbol, ask, sl, tp, EA_Name + " " + sessionLabel[s] + " long"))
       {
-         longTaken = true;
-         Print(EA_Name, " | LONG breakout entry @", ask, " SL:", sl, " TP:", tp);
+         longTaken[s] = true;
+         Print(EA_Name, " | ", sessionLabel[s], " LONG breakout @", ask, " SL:", sl, " TP:", tp);
       }
    }
 
-   // Short breakdown
-   if(!shortTaken && bid < rangeLow)
+   if(!shortTaken[s] && bid < rangeLow[s])
    {
-      double sl = rangeHigh + buffer;
+      double sl = rangeHigh[s] + buffer;
       double tp = bid - (rangeSize * RR_Multiple);
       trade.SetExpertMagicNumber(MagicORB);
-      if(trade.Sell(LotSize, _Symbol, bid, sl, tp, EA_Name + " short breakdown"))
+      if(trade.Sell(LotSize, _Symbol, bid, sl, tp, EA_Name + " " + sessionLabel[s] + " short"))
       {
-         shortTaken = true;
-         Print(EA_Name, " | SHORT breakdown entry @", bid, " SL:", sl, " TP:", tp);
+         shortTaken[s] = true;
+         Print(EA_Name, " | ", sessionLabel[s], " SHORT breakdown @", bid, " SL:", sl, " TP:", tp);
       }
    }
 }
@@ -192,8 +207,9 @@ void CheckBreakoutEntries()
 int CountTradesToday()
 {
    int count = 0;
-   datetime dayStart = rangeDayStamp - (rangeDayStamp % 86400);
-   if(!HistorySelect(dayStart, TimeGMT())) return 0;
+   datetime now = TimeGMT();
+   datetime dayStart = now - (now % 86400);
+   if(!HistorySelect(dayStart, now)) return 0;
    int total = HistoryDealsTotal();
    for(int i = 0; i < total; i++)
    {
@@ -214,7 +230,7 @@ void InitCSV()
       handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
       if(handle != INVALID_HANDLE)
       {
-         FileWrite(handle, "ticket","symbol","type","open_time","close_time",
+         FileWrite(handle, "ticket","symbol","session","type","open_time","close_time",
                    "open_price","close_price","volume","profit","range_high","range_low");
          FileClose(handle);
       }
@@ -238,18 +254,23 @@ void LogClosedTrades()
       if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
       if(ticket <= lastLoggedTicket) continue;
 
+      string comment = HistoryDealGetString(ticket, DEAL_COMMENT);
+      string session = (StringFind(comment, "NY") >= 0) ? "NY" : "LONDON";
       double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+
       int handle = FileOpen(CSV_PATH, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
       if(handle != INVALID_HANDLE)
       {
          FileSeek(handle, 0, SEEK_END);
-         FileWrite(handle, ticket, _Symbol,
+         FileWrite(handle, ticket, _Symbol, session,
                    (HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_SELL ? "BUY" : "SELL"),
                    TimeToString(HistoryDealGetInteger(ticket, DEAL_TIME)),
                    TimeToString(TimeCurrent()),
                    0, HistoryDealGetDouble(ticket, DEAL_PRICE),
                    HistoryDealGetDouble(ticket, DEAL_VOLUME),
-                   profit, rangeHigh, rangeLow);
+                   profit,
+                   (session == "NY" ? rangeHigh[1] : rangeHigh[0]),
+                   (session == "NY" ? rangeLow[1]  : rangeLow[0]));
          FileClose(handle);
       }
       lastLoggedTicket = ticket;
@@ -260,9 +281,15 @@ void LogClosedTrades()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   ResetDailyStateIfNeeded();
-   BuildOpeningRange();
-   CheckBreakoutEntries();
+   ResetDailyStateIfNeeded(0, LondonStartHour, LondonStartMin);
+   ResetDailyStateIfNeeded(1, NYStartHour, NYStartMin);
+
+   BuildOpeningRange(0);
+   BuildOpeningRange(1);
+
+   CheckBreakoutEntries(0);
+   CheckBreakoutEntries(1);
+
    LogClosedTrades();
 }
 //+------------------------------------------------------------------+
