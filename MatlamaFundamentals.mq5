@@ -21,6 +21,7 @@ input int    MagicMB          = 20260101;  // matlamaBridgeV3
 input int    MagicScalp       = 20260103;  // MatlamaScalper
 input int    MagicQuant       = 20260201;  // MatlamaQuant
 input int    MagicHFT         = 20260102;  // MatlamaBridgeHFT
+input int    MagicORB         = 20260301;  // MatlamaORB (rule-based, no orchestrator link)
 
 //--- News Calendar (update weekly, times in UTC)
 //--- Format: "YYYY.MM.DD HH:MM|NAME|HIGH or LOW"
@@ -122,6 +123,7 @@ void OnTick()
       CloseByMagic(MagicScalp);
       CloseByMagic(MagicQuant);
       CloseByMagic(MagicHFT);
+      CloseByMagic(MagicORB);
       return;
    }
 
