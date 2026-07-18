@@ -121,6 +121,12 @@ OrchDecision OrchGetDecision(string server_url, string payload)
       return result;
    }
 
+   if(res != 200)
+   {
+      Print("ORCH ERROR | HTTP ", res, " from ", server_url);
+      return result;
+   }
+
    string response = CharArrayToString(reply);
    if(StringLen(response) == 0)
    {

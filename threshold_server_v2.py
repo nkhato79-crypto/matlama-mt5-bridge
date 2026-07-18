@@ -17,7 +17,9 @@ Task Scheduler: Matlama_ThresholdServer (on startup, SYSTEM)
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
+from functools import wraps
 
 import joblib
 import numpy as np
@@ -38,8 +40,11 @@ QUANT_SCALER_PATH = os.path.join(MODEL_DIR, "quant_scaler.pkl")
 
 DEFAULT_THRESHOLD       = 0.55
 QUANT_DEFAULT_THRESHOLD = 0.60
+API_KEY = os.getenv("THRESHOLD_API_KEY", "")
 
 os.makedirs(LOG_DIR, exist_ok=True)
+
+_model_lock = threading.Lock()
 
 logging.basicConfig(
     filename=os.path.join(LOG_DIR, "threshold_server.log"),
@@ -49,6 +54,19 @@ logging.basicConfig(
 logger = logging.getLogger("threshold_server")
 
 app = Flask(__name__)
+
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not API_KEY:
+            return f(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        if auth == f"Bearer {API_KEY}":
+            return f(*args, **kwargs)
+        return jsonify({"error": "Unauthorized"}), 401
+    return decorated
+
 
 # ---------------------------------------------------------------------------
 # Model store — lazy load with hot reload
@@ -78,17 +96,23 @@ def load_model(key):
     mtime = os.path.getmtime(store["path"])
     if store["model"] is not None and mtime == store["mtime"]:
         return True
-    try:
-        store["model"] = joblib.load(store["path"])
-        if os.path.exists(store["scaler_path"]):
-            store["scaler"] = joblib.load(store["scaler_path"])
-        store["mtime"] = mtime
-        logger.info("Model [%s] reloaded (mtime=%s)", key,
-                    datetime.fromtimestamp(mtime))
-        return True
-    except Exception as e:
-        logger.error("Failed to load model [%s]: %s", key, e)
-        return False
+    with _model_lock:
+        if store["model"] is not None and mtime == store["mtime"]:
+            return True
+        try:
+            model = joblib.load(store["path"])
+            scaler = None
+            if os.path.exists(store["scaler_path"]):
+                scaler = joblib.load(store["scaler_path"])
+            store["model"] = model
+            store["scaler"] = scaler
+            store["mtime"] = mtime
+            logger.info("Model [%s] reloaded (mtime=%s)", key,
+                        datetime.fromtimestamp(mtime))
+            return True
+        except Exception as e:
+            logger.error("Failed to load model [%s]: %s", key, e)
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +172,7 @@ def get_quant_threshold():
 
 
 @app.route("/predict", methods=["POST"])
+@require_api_key
 def predict():
     ok = load_model("mbv3")
     if not ok:
@@ -171,6 +196,7 @@ def predict():
 
 
 @app.route("/quant_predict", methods=["POST"])
+@require_api_key
 def quant_predict():
     ok = load_model("quant")
     if not ok:

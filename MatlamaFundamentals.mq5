@@ -87,7 +87,9 @@ void CloseByMagic(int magic)
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-      if(ticket > 0 && (int)PositionGetInteger(POSITION_MAGIC) == magic)
+      if(ticket > 0 &&
+         (int)PositionGetInteger(POSITION_MAGIC) == magic &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol)
          trade.PositionClose(ticket);
    }
 }

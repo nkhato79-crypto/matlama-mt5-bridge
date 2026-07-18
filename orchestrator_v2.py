@@ -32,20 +32,25 @@ Runs: Flask (localhost:7000)
 """
 
 from flask import Flask, request, jsonify
+from functools import wraps
 import numpy as np
 import joblib
+import json
 import os
 import logging
 from collections import deque
 from datetime import datetime
+import threading
 
 # =========================================================
 # APP INIT
 # =========================================================
 app = Flask(__name__)
 
-BASE_DIR = r"C:\Matlama\model"
-LOG_DIR = r"C:\Matlama\logs"
+BASE_DIR = os.getenv("MODEL_DIR", r"C:\Matlama\model")
+LOG_DIR = os.getenv("LOG_DIR", r"C:\Matlama\logs")
+MEMORY_FILE = os.path.join(LOG_DIR, "trade_memory.json")
+API_KEY = os.getenv("ORCH_API_KEY", "")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -54,6 +59,18 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger("orchestrator_v2")
+
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not API_KEY:
+            return f(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        if auth == f"Bearer {API_KEY}":
+            return f(*args, **kwargs)
+        return jsonify({"error": "Unauthorized"}), 401
+    return decorated
 
 
 def load_pair(model_name, scaler_name, label):
@@ -94,8 +111,31 @@ STRATEGIES = {
 # TRADE MEMORY SYSTEM
 # =========================================================
 class TradeMemory:
-    def __init__(self, maxlen=300):
+    def __init__(self, maxlen=300, persist_path=None):
         self.trades = deque(maxlen=maxlen)
+        self._persist_path = persist_path
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        if self._persist_path and os.path.exists(self._persist_path):
+            try:
+                with open(self._persist_path, "r") as f:
+                    data = json.load(f)
+                for t in data:
+                    self.trades.append(t)
+                logger.info(f"Loaded {len(self.trades)} trades from disk")
+            except Exception as e:
+                logger.warning(f"Could not load trade memory: {e}")
+
+    def _save(self):
+        if not self._persist_path:
+            return
+        try:
+            with open(self._persist_path, "w") as f:
+                json.dump(list(self.trades), f)
+        except Exception as e:
+            logger.warning(f"Could not persist trade memory: {e}")
 
     def add(self, trade):
         """
@@ -106,7 +146,9 @@ class TradeMemory:
             "score": float
         }
         """
-        self.trades.append(trade)
+        with self._lock:
+            self.trades.append(trade)
+            self._save()
 
     def win_rate(self, regime=None, strategy=None):
         data = list(self.trades)
@@ -154,7 +196,7 @@ class TradeMemory:
         return count if last_result == 1 else -count
 
 
-memory = TradeMemory()
+memory = TradeMemory(persist_path=MEMORY_FILE)
 
 
 # =========================================================
@@ -288,6 +330,7 @@ def risk_filter(f, regime):
 # ROUTES
 # =========================================================
 @app.route("/decision_v2", methods=["POST"])
+@require_api_key
 def decision_v2():
     f = request.get_json(force=True) or {}
 
@@ -341,6 +384,7 @@ def decision_v2():
 
 
 @app.route("/report_trade", methods=["POST"])
+@require_api_key
 def report_trade():
     f = request.get_json(force=True) or {}
 

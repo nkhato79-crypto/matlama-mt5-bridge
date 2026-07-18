@@ -56,6 +56,7 @@ input double   MaxAccountDrawdownPct  = 0.20;
 CTrade   trade;
 datetime LastCheck        = 0;
 string   LastSignal       = "";
+datetime LastSignalBar    = 0;
 double   dailyStartBalance;
 datetime dailyResetTime;
 int      atrHandle;
@@ -65,6 +66,8 @@ int      adxHandle;
 int      emaFastHandle;
 int      emaSlowHandle;
 string   LastRegime = "UNKNOWN";
+int      entryBuyScore   = 0;
+int      entrySellScore  = 0;
 
 //--- CSV logging
 string   CSV_PATH = "bridgev3_trades.csv"; // renamed from hft_trades.csv — was colliding with MatlamaBridgeHFT.mq5, which writes to the same filename with incompatible column meaning
@@ -75,10 +78,10 @@ ulong    lastLoggedTicket = 0;
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -118,7 +121,7 @@ void LogClosedTrades()
 
    // Open in append mode — READ|WRITE then seek to end
    int handle = FileOpen(CSV_PATH,
-                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
       Print("CSV ERROR: Cannot open for append. Error:", GetLastError());
@@ -161,8 +164,8 @@ void LogClosedTrades()
       }
 
       int durationMin = (int)((closeTime - entryTime) / 60);
-      int bScore = EvaluateSignal("BUY");
-      int sScore = EvaluateSignal("SELL");
+      int bScore = entryBuyScore;
+      int sScore = entrySellScore;
 
       FileWrite(handle,
          (string)ticket,
@@ -266,6 +269,13 @@ void OnTick()
    if((TimeCurrent() - LastCheck) < PollSeconds) return;
    LastCheck = TimeCurrent();
 
+   datetime currentBar = iTime(_Symbol, PERIOD_H1, 0);
+   if(currentBar != LastSignalBar)
+   {
+      LastSignal = "";
+      LastSignalBar = currentBar;
+   }
+
    // === ORCHESTRATOR v2 — FULL OVERRIDE ===
    // The 9-layer scoring model (EvaluateSignal) is bypassed; the orchestrator's
    // decision (BUY/SELL/HOLD) is authoritative.
@@ -344,7 +354,8 @@ void OnTick()
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetTicket(i) > 0 &&
-         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol)
       {
          Print("Position already open. Skipping.");
          return;
@@ -376,7 +387,12 @@ void OnTick()
       else        Print("SELL failed: ", trade.ResultRetcodeDescription());
    }
 
-   if(success) LastSignal = action;
+   if(success)
+   {
+      LastSignal = action;
+      entryBuyScore  = EvaluateSignal("BUY");
+      entrySellScore = EvaluateSignal("SELL");
+   }
 }
 
 //+------------------------------------------------------------------+

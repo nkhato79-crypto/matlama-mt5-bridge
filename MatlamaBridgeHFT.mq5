@@ -287,10 +287,10 @@ bool RSIConfirms(string direction)
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -328,7 +328,7 @@ void LogClosedTrades()
    if(!hasNew) return;
 
    int handle = FileOpen(CSV_PATH,
-                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE) return;
    FileSeek(handle, 0, SEEK_END);
 
@@ -619,8 +619,6 @@ void OnTick()
          " | Confidence: ", DoubleToString(dec.confidence, 3),
          " | Regime: ", dec.regime, " | Price: ", price);
 
-   double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double pipSize = point * 10;
    double sl_dist = SL_Pips * pipSize;
    double tp_dist = TP_Pips * pipSize;
    bool   success = false;

@@ -756,10 +756,10 @@ void GetTradeLevels(string direction, double nearestFib, string regime, double c
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -806,7 +806,7 @@ void LogClosedTrades()
    if(!hasNew) return;
 
    int handle = FileOpen(CSV_PATH,
-                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE) return;
    FileSeek(handle, 0, SEEK_END);
 
@@ -861,16 +861,17 @@ void LogClosedTrades()
          velocityPipsLog = (velRates[0].close - velRates[2].close) / pipSizeLog;
       }
 
-      // Get volume ratio
+      // Get volume ratio — M5 to match live serving in OnTick
       long volBuf[];
       ArraySetAsSeries(volBuf, true);
       double volRatio = 0;
-      if(CopyTickVolume(_Symbol, PERIOD_M1, 0, VolumePeriod + 1, volBuf) >= VolumePeriod + 1)
+      if(CopyTickVolume(_Symbol, PERIOD_M5, 0, VolumePeriod + 1, volBuf) >= VolumePeriod + 1)
       {
          double avgVol = 0;
          for(int k = 1; k <= VolumePeriod; k++) avgVol += (double)volBuf[k];
          avgVol /= VolumePeriod;
-         volRatio = (double)volBuf[0] / avgVol;
+         if(avgVol > 0)
+            volRatio = (double)volBuf[0] / avgVol;
       }
 
       // Get RSI acceleration
@@ -1108,7 +1109,8 @@ void OnTick()
       double avgVolLive = 0;
       for(int k = 1; k <= VolumePeriod; k++) avgVolLive += (double)volBuf3[k];
       avgVolLive /= VolumePeriod;
-      volRatioLive = (double)volBuf3[0] / avgVolLive;
+      if(avgVolLive > 0)
+         volRatioLive = (double)volBuf3[0] / avgVolLive;
    }
 
    double rsiAccelLive = 0;
