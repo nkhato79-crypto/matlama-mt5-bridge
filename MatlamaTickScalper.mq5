@@ -1,100 +1,98 @@
 //+------------------------------------------------------------------+
 //|                                        MatlamaTickScalper.mq5    |
 //|                                      Matlama Tech © 2026         |
-//|              Tick-Based Micro Scalper                             |
-//|         Targets small quick profits via tick microstructure.      |
-//|         Analyzes tick velocity, frequency, and bid/ask flow.     |
+//|              VWAP Mean-Reversion Micro Scalper                   |
+//|         Institutional strategy: enter when price deviates from   |
+//|         VWAP bands, profit as it reverts to fair value.          |
 //+------------------------------------------------------------------+
 #property copyright "Matlama Tech 2026"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
 
-//--- Input Parameters
-input string   EA_Name          = "MatlamaTickScalper v1";
+//--- Core Parameters
+input string   EA_Name          = "MatlamaTickScalper v2";
 input double   LotSize          = 0.01;
 input int      MagicNumber      = 20260103;
-input int      TP_Pips          = 5;           // take profit
-input int      SL_Pips          = 8;           // stop loss
-input int      MaxHoldSeconds   = 120;         // forced exit after this
-input int      MaxTradesPerDay  = 30;          // quality gate
+input int      MaxHoldSeconds   = 300;         // 5 min max hold
+input int      MaxTradesPerDay  = 20;          // quality over quantity
 input double   MaxDailyLoss     = 50.0;        // account-currency cap
 input bool     AutoTrade        = true;
 
-//--- Tick Analysis
-input int      TickBufferSize   = 50;          // ticks to keep
-input double   MinTickVelocity  = 2.0;         // pips/sec for burst
-input double   MinImbalance     = 0.65;        // directional bias (0.5 = neutral)
-input double   MinTickFreq      = 3.0;         // ticks/sec liquidity floor
+//--- VWAP Settings
+input int      VWAPBars         = 60;          // M1 bars for rolling VWAP (1 hour)
+input double   EntryBandMult    = 1.5;         // enter at VWAP ± 1.5σ
+input double   StopBandMult     = 2.5;         // SL at VWAP ± 2.5σ
+input int      MinTP_Pips       = 2;           // skip if VWAP too close
+input int      MaxTP_Pips       = 15;          // cap the TP distance
+input int      MinSL_Pips       = 3;           // floor for SL
+input int      MaxSL_Pips       = 15;          // cap for SL
+
+//--- Confirmation Filters
+input int      RSI_Period       = 14;          // RSI period
+input int      RSI_OB           = 65;          // overbought threshold
+input int      RSI_OS           = 35;          // oversold threshold
+input int      ADX_Period       = 14;          // ADX period
+input int      ADX_Max          = 30;          // skip trending markets
 input double   MaxSpreadPips    = 2.5;         // max spread to enter
-input double   MinSpreadPips    = 0.3;         // below this is suspicious
+input double   MinBandWidth     = 0.5;         // skip if σ < 0.5 pips
 
 //--- Risk Management
-input double   BreakevenPips    = 3.0;         // move SL to BE after X pips
-input double   TrailStartPips   = 4.0;         // start trailing after X pips
+input double   BreakevenPips    = 3.0;         // move SL to BE
+input double   TrailStartPips   = 4.0;         // start trailing
 input double   TrailStepPips    = 1.5;         // trail distance
-input int      CooldownSeconds  = 5;           // gap between trades
+input int      CooldownSeconds  = 10;          // gap between trades
 
 //--- Session Filter
-input bool     LondonSession    = true;        // 07:00–16:00 UTC
-input bool     NewYorkSession   = true;        // 12:00–21:00 UTC
-input bool     AsiaSession      = false;       // 00:00–09:00 UTC
+input bool     LondonSession    = true;        // 07:00-16:00 UTC
+input bool     NewYorkSession   = true;        // 12:00-21:00 UTC
+input bool     AsiaSession      = false;       // 00:00-09:00 UTC
 
-//--- Orchestrator (feedback only — entry decisions are local)
+//--- Orchestrator (feedback loop only)
 input string   ORCH_REPORT      = "http://127.0.0.1:7000/report_trade";
-
-//+------------------------------------------------------------------+
-//| Tick ring-buffer record                                           |
-//+------------------------------------------------------------------+
-struct TickRecord
-{
-   long     time_msc;
-   double   bid;
-   double   ask;
-   int      direction;     // +1 uptick, -1 downtick, 0 flat
-};
 
 //+------------------------------------------------------------------+
 //| Global state                                                      |
 //+------------------------------------------------------------------+
-TickRecord  ticks[];
-int         tHead            = 0;
-int         tCount           = 0;
-
 CTrade      trade;
 double      pipSize;
 int         digits;
 int         dailyTradeCount  = 0;
 double      dailyPnL         = 0.0;
 datetime    currentDay       = 0;
-long        lastEntryMsc     = 0;
-double      lastBid          = 0;
+datetime    lastEntryTime    = 0;
 string      LastRegime       = "UNKNOWN";
 ulong       lastLoggedTicket = 0;
 
-// entry-time features kept for CSV logging
-double      entryTickVelocity  = 0;
-double      entryTickFreq      = 0;
-double      entrySpreadPips    = 0;
-double      entryImbalance     = 0;
-double      entryMomentum      = 0;
+// indicator handles
+int         rsiHandle        = INVALID_HANDLE;
+int         adxHandle        = INVALID_HANDLE;
+
+// cached calculations (updated once per M1 bar)
+datetime    lastVWAPBar      = 0;
+double      cachedVWAP       = 0;
+double      cachedStdDev     = 0;
+double      prevVWAP         = 0;
+double      vwapSlope        = 0;
+
+datetime    lastIndBar       = 0;
+double      cachedRSI        = 50;
+double      cachedADX        = 25;
+
+// entry-time features for CSV logging
+double      entryVWAPDev     = 0;
+double      entryRSI         = 0;
+double      entryADX         = 0;
+double      entrySpread      = 0;
+double      entryVWAPSlope   = 0;
 
 //+------------------------------------------------------------------+
 //| OnInit                                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   ArrayResize(ticks, TickBufferSize);
-   for(int i = 0; i < TickBufferSize; i++)
-   {
-      ticks[i].time_msc  = 0;
-      ticks[i].bid       = 0;
-      ticks[i].ask       = 0;
-      ticks[i].direction = 0;
-   }
-
    pipSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
    digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
@@ -102,12 +100,23 @@ int OnInit()
    trade.SetDeviationInPoints(5);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
+   rsiHandle = iRSI(_Symbol, PERIOD_M5, RSI_Period, PRICE_CLOSE);
+   adxHandle = iADX(_Symbol, PERIOD_M5, ADX_Period);
+
+   if(rsiHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE)
+   {
+      Print(EA_Name, " FAILED — indicator handles invalid");
+      return INIT_FAILED;
+   }
+
    currentDay = iTime(_Symbol, PERIOD_D1, 0);
    InitCSV();
 
-   Print(EA_Name, " init | ", _Symbol, " pip=", pipSize,
-         " TP=", TP_Pips, " SL=", SL_Pips,
-         " buf=", TickBufferSize);
+   Print(EA_Name, " init | ", _Symbol,
+         " pip=", pipSize,
+         " VWAP=", VWAPBars, " bars",
+         " entry=", DoubleToString(EntryBandMult, 1), "σ",
+         " stop=", DoubleToString(StopBandMult, 1), "σ");
    return INIT_SUCCEEDED;
 }
 
@@ -116,9 +125,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   Print(EA_Name, " removed | reason=", reason,
-         " | day_trades=", dailyTradeCount,
-         " | day_pnl=", DoubleToString(dailyPnL, 2));
+   if(rsiHandle != INVALID_HANDLE) IndicatorRelease(rsiHandle);
+   if(adxHandle != INVALID_HANDLE) IndicatorRelease(adxHandle);
+   Print(EA_Name, " removed | trades=", dailyTradeCount,
+         " pnl=", DoubleToString(dailyPnL, 2));
 }
 
 //+------------------------------------------------------------------+
@@ -126,186 +136,207 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // --- daily reset ---
+   // daily reset
    datetime today = iTime(_Symbol, PERIOD_D1, 0);
    if(today != currentDay)
    {
-      Print("TICK_SCALPER day reset | trades=", dailyTradeCount,
+      Print("VWAP_SCALP day reset | trades=", dailyTradeCount,
             " pnl=", DoubleToString(dailyPnL, 2));
       dailyTradeCount = 0;
       dailyPnL        = 0.0;
-      currentDay       = today;
+      currentDay      = today;
    }
 
-   // --- collect tick ---
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick)) return;
-   AddTick(tick);
+   // update cached indicators
+   UpdateVWAP();
+   UpdateIndicators();
 
-   // --- log any closed trades ---
+   // log closed trades
    LogClosedTrades();
 
-   // --- manage open position ---
+   // manage open position
    if(HasPosition())
    {
-      ManagePosition(tick);
-      return;        // one position at a time
+      ManagePosition();
+      return;
    }
 
-   // --- entry gates ---
-   if(!AutoTrade)                                return;
-   if(dailyTradeCount >= MaxTradesPerDay)         return;
-   if(dailyPnL <= -MaxDailyLoss)                  return;
-   if(!InSession())                               return;
-   if(tick.time_msc - lastEntryMsc < CooldownSeconds * 1000) return;
-   if(tCount < TickBufferSize / 2)                return;
+   // entry gates
+   if(!AutoTrade)                                      return;
+   if(dailyTradeCount >= MaxTradesPerDay)               return;
+   if(dailyPnL <= -MaxDailyLoss)                        return;
+   if(!InSession())                                     return;
+   if((int)(TimeCurrent() - lastEntryTime) < CooldownSeconds) return;
 
-   CheckEntry(tick);
+   CheckEntry();
 }
 
 //+------------------------------------------------------------------+
-//| Ring-buffer: add tick                                              |
+//| VWAP calculation from M1 bars (updated once per new M1 bar)       |
 //+------------------------------------------------------------------+
-void AddTick(const MqlTick &tick)
+void UpdateVWAP()
 {
-   int dir = 0;
-   if(lastBid > 0)
+   datetime currentBar = iTime(_Symbol, PERIOD_M1, 0);
+   if(currentBar == lastVWAPBar) return;
+   lastVWAPBar = currentBar;
+
+   prevVWAP = cachedVWAP;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, PERIOD_M1, 0, VWAPBars, rates);
+   if(copied < VWAPBars / 2)
    {
-      if(tick.bid > lastBid)      dir =  1;
-      else if(tick.bid < lastBid) dir = -1;
+      cachedVWAP   = 0;
+      cachedStdDev = 0;
+      return;
    }
-   lastBid = tick.bid;
 
-   ticks[tHead].time_msc  = tick.time_msc;
-   ticks[tHead].bid       = tick.bid;
-   ticks[tHead].ask       = tick.ask;
-   ticks[tHead].direction = dir;
-
-   tHead = (tHead + 1) % TickBufferSize;
-   if(tCount < TickBufferSize) tCount++;
-}
-
-//+------------------------------------------------------------------+
-//| Tick velocity — signed pips / second over the buffer              |
-//+------------------------------------------------------------------+
-double GetTickVelocity()
-{
-   if(tCount < 5) return 0;
-   int newest = (tHead - 1 + TickBufferSize) % TickBufferSize;
-   int oldest = (tHead - tCount + TickBufferSize) % TickBufferSize;
-
-   double priceDiff = (ticks[newest].bid - ticks[oldest].bid) / pipSize;
-   double timeDiff  = (double)(ticks[newest].time_msc - ticks[oldest].time_msc) / 1000.0;
-   if(timeDiff <= 0) return 0;
-   return priceDiff / timeDiff;
-}
-
-//+------------------------------------------------------------------+
-//| Tick frequency — ticks / second                                   |
-//+------------------------------------------------------------------+
-double GetTickFrequency()
-{
-   if(tCount < 5) return 0;
-   int newest = (tHead - 1 + TickBufferSize) % TickBufferSize;
-   int oldest = (tHead - tCount + TickBufferSize) % TickBufferSize;
-
-   double timeDiff = (double)(ticks[newest].time_msc - ticks[oldest].time_msc) / 1000.0;
-   if(timeDiff <= 0) return 0;
-   return (double)tCount / timeDiff;
-}
-
-//+------------------------------------------------------------------+
-//| Directional imbalance — fraction of up-ticks (1.0=all up)         |
-//+------------------------------------------------------------------+
-double GetImbalance()
-{
-   if(tCount < 5) return 0.5;
-   int ups = 0, moves = 0;
-   for(int i = 0; i < tCount; i++)
+   // VWAP = Σ(typical_price × tick_volume) / Σ(tick_volume)
+   double sumPV = 0, sumV = 0;
+   for(int i = 0; i < copied; i++)
    {
-      int idx = (tHead - 1 - i + TickBufferSize) % TickBufferSize;
-      if(ticks[idx].direction != 0)
-      {
-         moves++;
-         if(ticks[idx].direction > 0) ups++;
-      }
+      double tp  = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
+      double vol = (double)rates[i].tick_volume;
+      if(vol <= 0) vol = 1;
+      sumPV += tp * vol;
+      sumV  += vol;
    }
-   if(moves == 0) return 0.5;
-   return (double)ups / (double)moves;
+
+   if(sumV <= 0) { cachedVWAP = 0; cachedStdDev = 0; return; }
+   cachedVWAP = sumPV / sumV;
+
+   // volume-weighted standard deviation
+   double sumVar = 0;
+   for(int i = 0; i < copied; i++)
+   {
+      double tp  = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
+      double vol = (double)rates[i].tick_volume;
+      if(vol <= 0) vol = 1;
+      sumVar += vol * (tp - cachedVWAP) * (tp - cachedVWAP);
+   }
+   cachedStdDev = MathSqrt(sumVar / sumV);
+
+   // VWAP slope (pips per M1 bar)
+   if(prevVWAP > 0)
+      vwapSlope = (cachedVWAP - prevVWAP) / pipSize;
 }
 
 //+------------------------------------------------------------------+
-//| Momentum score — combined velocity × directional conviction       |
+//| RSI + ADX (updated once per new M5 bar)                           |
 //+------------------------------------------------------------------+
-double GetMomentumScore(double velocity, double imbalance)
+void UpdateIndicators()
 {
-   double dirBias = MathAbs(imbalance - 0.5) * 2.0;   // 0→1
-   return MathAbs(velocity) * (0.5 + 0.5 * dirBias);
+   datetime currentBar = iTime(_Symbol, PERIOD_M5, 0);
+   if(currentBar == lastIndBar) return;
+   lastIndBar = currentBar;
+
+   double rsiVal[1], adxVal[1];
+   if(CopyBuffer(rsiHandle, 0, 0, 1, rsiVal) == 1) cachedRSI = rsiVal[0];
+   if(CopyBuffer(adxHandle, 0, 0, 1, adxVal) == 1) cachedADX = adxVal[0];
 }
 
 //+------------------------------------------------------------------+
-//| Entry logic                                                       |
+//| Entry logic — VWAP mean reversion                                 |
 //+------------------------------------------------------------------+
-void CheckEntry(const MqlTick &tick)
+void CheckEntry()
 {
-   double spread = (tick.ask - tick.bid) / pipSize;
-   if(spread > MaxSpreadPips || spread < MinSpreadPips) return;
+   if(cachedVWAP <= 0 || cachedStdDev <= 0) return;
 
-   double velocity  = GetTickVelocity();
-   double frequency = GetTickFrequency();
-   double imbalance = GetImbalance();
-   double momentum  = GetMomentumScore(velocity, imbalance);
+   // band width too narrow — no meaningful deviation
+   double bandWidthPips = cachedStdDev / pipSize;
+   if(bandWidthPips < MinBandWidth) return;
 
-   if(frequency < MinTickFreq)              return;
-   if(MathAbs(velocity) < MinTickVelocity)  return;
+   // trend filter — skip trending markets
+   if(cachedADX > ADX_Max) return;
 
-   // direction from momentum + imbalance agreement
+   // spread check
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spread = (ask - bid) / pipSize;
+   if(spread > MaxSpreadPips) return;
+
+   double price = (bid + ask) / 2.0;
+
+   // how far is price from VWAP in standard deviations?
+   double deviation = (price - cachedVWAP) / cachedStdDev;
+
+   // entry bands
+   double upperEntry = cachedVWAP + EntryBandMult * cachedStdDev;
+   double lowerEntry = cachedVWAP - EntryBandMult * cachedStdDev;
+
    string direction = "";
-   if(velocity > MinTickVelocity && imbalance > MinImbalance)
+
+   // BUY: price at/below lower band + RSI confirms oversold
+   if(price <= lowerEntry && cachedRSI < RSI_OS)
       direction = "BUY";
-   else if(velocity < -MinTickVelocity && imbalance < (1.0 - MinImbalance))
+   // SELL: price at/above upper band + RSI confirms overbought
+   else if(price >= upperEntry && cachedRSI > RSI_OB)
       direction = "SELL";
+
    if(direction == "") return;
 
-   // store features for CSV
-   entryTickVelocity = velocity;
-   entryTickFreq     = frequency;
-   entrySpreadPips   = spread;
-   entryImbalance    = imbalance;
-   entryMomentum     = momentum;
-
-   double sl_dist = SL_Pips * pipSize;
-   double tp_dist = TP_Pips * pipSize;
-   bool   success = false;
-
+   // calculate dynamic TP (to VWAP) and SL (to outer band)
+   double tp_dist_raw = 0, sl_dist_raw = 0;
    if(direction == "BUY")
    {
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double sl  = NormalizeDouble(ask - sl_dist, digits);
-      double tp  = NormalizeDouble(ask + tp_dist, digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, EA_Name);
+      tp_dist_raw = cachedVWAP - ask;                                  // distance to VWAP
+      sl_dist_raw = ask - (cachedVWAP - StopBandMult * cachedStdDev);  // distance to stop band
    }
    else
    {
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double sl  = NormalizeDouble(bid + sl_dist, digits);
-      double tp  = NormalizeDouble(bid - tp_dist, digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, EA_Name);
+      tp_dist_raw = bid - cachedVWAP;
+      sl_dist_raw = (cachedVWAP + StopBandMult * cachedStdDev) - bid;
+   }
+
+   double tp_pips = tp_dist_raw / pipSize;
+   double sl_pips = sl_dist_raw / pipSize;
+
+   // enforce min/max
+   if(tp_pips < MinTP_Pips) return;      // deviation too small to be worth it
+   if(tp_pips > MaxTP_Pips) tp_pips = MaxTP_Pips;
+   if(sl_pips < MinSL_Pips) sl_pips = MinSL_Pips;
+   if(sl_pips > MaxSL_Pips) sl_pips = MaxSL_Pips;
+
+   double tp_dist = tp_pips * pipSize;
+   double sl_dist = sl_pips * pipSize;
+
+   // store entry features for CSV
+   entryVWAPDev   = deviation;
+   entryRSI       = cachedRSI;
+   entryADX       = cachedADX;
+   entrySpread    = spread;
+   entryVWAPSlope = vwapSlope;
+
+   bool success = false;
+   if(direction == "BUY")
+   {
+      double sl = NormalizeDouble(ask - sl_dist, digits);
+      double tp = NormalizeDouble(ask + tp_dist, digits);
+      success   = trade.Buy(LotSize, _Symbol, 0, sl, tp, EA_Name);
+   }
+   else
+   {
+      double sl = NormalizeDouble(bid + sl_dist, digits);
+      double tp = NormalizeDouble(bid - tp_dist, digits);
+      success   = trade.Sell(LotSize, _Symbol, 0, sl, tp, EA_Name);
    }
 
    if(success)
    {
       dailyTradeCount++;
-      lastEntryMsc = tick.time_msc;
-      Print("TICK SCALP ", direction,
-            " | vel=", DoubleToString(velocity, 2),
-            " freq=", DoubleToString(frequency, 1),
-            " imbal=", DoubleToString(imbalance, 2),
-            " spread=", DoubleToString(spread, 1),
-            " mom=", DoubleToString(momentum, 2));
+      lastEntryTime = TimeCurrent();
+      Print("VWAP SCALP ", direction,
+            " | dev=", DoubleToString(deviation, 2), "σ",
+            " vwap=", DoubleToString(cachedVWAP, digits),
+            " rsi=", DoubleToString(cachedRSI, 1),
+            " adx=", DoubleToString(cachedADX, 1),
+            " tp=", DoubleToString(tp_pips, 1),
+            " sl=", DoubleToString(sl_pips, 1),
+            " spread=", DoubleToString(spread, 1));
    }
    else
-      Print("TICK SCALP ", direction, " FAILED: ", trade.ResultRetcodeDescription());
+      Print("VWAP SCALP ", direction, " FAILED: ", trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+
@@ -324,9 +355,9 @@ bool HasPosition()
 }
 
 //+------------------------------------------------------------------+
-//| Manage open position — breakeven, trail, time exit                |
+//| Manage position — breakeven, trail, time exit                     |
 //+------------------------------------------------------------------+
-void ManagePosition(const MqlTick &tick)
+void ManagePosition()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -341,21 +372,24 @@ void ManagePosition(const MqlTick &tick)
       long     posType   = PositionGetInteger(POSITION_TYPE);
       datetime openTime  = (datetime)PositionGetInteger(POSITION_TIME);
 
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
       double profitPips = 0;
       if(posType == POSITION_TYPE_BUY)
-         profitPips = (tick.bid - openPrice) / pipSize;
+         profitPips = (bid - openPrice) / pipSize;
       else
-         profitPips = (openPrice - tick.ask) / pipSize;
+         profitPips = (openPrice - ask) / pipSize;
 
-      // --- time exit ---
+      // time exit
       if((int)(TimeCurrent() - openTime) >= MaxHoldSeconds)
       {
          trade.PositionClose(ticket);
-         Print("TICK SCALP TIME EXIT | pips=", DoubleToString(profitPips, 1));
+         Print("VWAP SCALP TIME EXIT | pips=", DoubleToString(profitPips, 1));
          return;
       }
 
-      // --- breakeven ---
+      // breakeven
       if(profitPips >= BreakevenPips && profitPips < TrailStartPips)
       {
          double beSL;
@@ -373,20 +407,20 @@ void ManagePosition(const MqlTick &tick)
          }
       }
 
-      // --- trailing stop ---
+      // trailing stop
       if(profitPips >= TrailStartPips)
       {
          double trailDist = TrailStepPips * pipSize;
          double newSL;
          if(posType == POSITION_TYPE_BUY)
          {
-            newSL = NormalizeDouble(tick.bid - trailDist, digits);
+            newSL = NormalizeDouble(bid - trailDist, digits);
             if(newSL > curSL)
                trade.PositionModify(ticket, newSL, curTP);
          }
          else
          {
-            newSL = NormalizeDouble(tick.ask + trailDist, digits);
+            newSL = NormalizeDouble(ask + trailDist, digits);
             if(newSL < curSL)
                trade.PositionModify(ticket, newSL, curTP);
          }
@@ -395,7 +429,7 @@ void ManagePosition(const MqlTick &tick)
 }
 
 //+------------------------------------------------------------------+
-//| Session filter (UTC hours)                                        |
+//| Session filter (UTC)                                              |
 //+------------------------------------------------------------------+
 bool InSession()
 {
@@ -410,7 +444,7 @@ bool InSession()
 }
 
 //+------------------------------------------------------------------+
-//| CSV — initialise with header row                                  |
+//| CSV — create with header                                          |
 //+------------------------------------------------------------------+
 void InitCSV()
 {
@@ -426,8 +460,7 @@ void InitCSV()
    FileWrite(h,
       "ticket","symbol","type","open_time","close_time",
       "open_price","close_price","volume","profit","swap","commission",
-      "duration_sec","tick_velocity","tick_frequency","spread_pips",
-      "imbalance","momentum_score");
+      "duration_sec","vwap_deviation","rsi","adx","spread_pips","vwap_slope");
    FileClose(h);
 }
 
@@ -445,24 +478,23 @@ void LogClosedTrades()
    {
       ulong ticket = HistoryDealGetTicket(i);
       if(ticket == 0) continue;
-      if(HistoryDealGetInteger(ticket, DEAL_MAGIC)  != MagicNumber) continue;
-      if(HistoryDealGetInteger(ticket, DEAL_ENTRY)  != DEAL_ENTRY_OUT) continue;
-      if(HistoryDealGetString(ticket, DEAL_SYMBOL)  != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != MagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
       if(ticket <= lastLoggedTicket) continue;
 
-      double profit  = HistoryDealGetDouble(ticket, DEAL_PROFIT);
-      double swap    = HistoryDealGetDouble(ticket, DEAL_SWAP);
-      double comm    = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
-      double volume  = HistoryDealGetDouble(ticket, DEAL_VOLUME);
-      double cPrice  = HistoryDealGetDouble(ticket, DEAL_PRICE);
-      long   dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
-      datetime cTime  = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      double   profit   = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      double   swap     = HistoryDealGetDouble(ticket, DEAL_SWAP);
+      double   comm     = HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+      double   volume   = HistoryDealGetDouble(ticket, DEAL_VOLUME);
+      double   cPrice   = HistoryDealGetDouble(ticket, DEAL_PRICE);
+      long     dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      datetime cTime    = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
 
-      // find matching entry deal for open_price / open_time
-      long   posId    = (long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
-      double oPrice   = cPrice;
-      datetime oTime  = cTime;
-      string typeStr  = (dealType == DEAL_TYPE_SELL) ? "BUY" : "SELL";
+      long     posId    = (long)HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      double   oPrice   = cPrice;
+      datetime oTime    = cTime;
+      string   typeStr  = (dealType == DEAL_TYPE_SELL) ? "BUY" : "SELL";
 
       for(int j = 0; j < total; j++)
       {
@@ -492,17 +524,17 @@ void LogClosedTrades()
          DoubleToString(swap,   2),
          DoubleToString(comm,   2),
          (string)durationSec,
-         DoubleToString(entryTickVelocity, 3),
-         DoubleToString(entryTickFreq,     2),
-         DoubleToString(entrySpreadPips,   2),
-         DoubleToString(entryImbalance,    3),
-         DoubleToString(entryMomentum,     3)
+         DoubleToString(entryVWAPDev,   3),
+         DoubleToString(entryRSI,       1),
+         DoubleToString(entryADX,       1),
+         DoubleToString(entrySpread,    2),
+         DoubleToString(entryVWAPSlope, 3)
       );
       FileClose(handle);
 
       lastLoggedTicket = ticket;
       dailyPnL += profit;
-      Print("TICK SCALP closed | #", ticket,
+      Print("VWAP SCALP closed | #", ticket,
             " profit=", DoubleToString(profit, 2),
             " dur=", durationSec, "s");
 

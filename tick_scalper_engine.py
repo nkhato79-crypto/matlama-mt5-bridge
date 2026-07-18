@@ -1,7 +1,7 @@
 """
-Matlama Tick Scalper Engine - ML Trainer
+Matlama Tick Scalper Engine - ML Trainer (VWAP Mean Reversion)
 Trains on tick_scalper_trades.csv (MatlamaTickScalper EA output)
-Features: tick_velocity, tick_frequency, spread_pips, imbalance, momentum_score
+Features: vwap_deviation, rsi, adx, spread_pips, vwap_slope
 Derives result from profit > 0
 
 Saves to C:\\Matlama\\model\\tick_scalper_model.pkl
@@ -39,11 +39,11 @@ MIN_TRADES = 50
 RETRAIN_INTERVAL_H = 24
 
 FEATURE_COLS = [
-    "tick_velocity",
-    "tick_frequency",
+    "vwap_deviation",
+    "rsi",
+    "adx",
     "spread_pips",
-    "imbalance",
-    "momentum_score",
+    "vwap_slope",
 ]
 
 os.makedirs(MODEL_DIR, exist_ok=True)
