@@ -70,6 +70,14 @@ input bool     EnableContinuation      = true;   // allow sweep + fresh (unretes
 input int      ContinuationFVGMaxAge   = 5;      // max bars since FVG formed to still count as "fresh"
 input double   ContinuationSL_BufferPips = 5.0;  // SL buffer beyond the fresh FVG's near edge
 
+//--- False Sweep Continuation Filter (blocks exhausted moves)
+input bool     EnableFalseSweepFilter     = true;
+input double   MaxTravelFromSweepPips     = 40.0;  // max pips price can travel from sweep and still chase
+input double   MaxEMAExtensionATR         = 2.0;   // max ATR units from slow EMA — beyond = overextended
+input int      RSIDivergenceBars          = 5;     // M5 bars to check for momentum divergence
+input double   MinContinuationVolRatio    = 1.0;   // volume must be above average to confirm institutional flow
+input int      FalseSweepMinFails         = 2;     // block if this many exhaustion signals fire (out of 4)
+
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck      = 0;
@@ -684,6 +692,115 @@ void GetContinuationTradeLevels(string direction, double gapTop, double gapBotto
 }
 
 //+------------------------------------------------------------------+
+//| False Sweep Continuation Filter                                  |
+//| Blocks continuation entries when the move is exhausted:          |
+//|   1. Price already traveled too far from the sweep level         |
+//|   2. Price overextended from slow EMA (in ATR units)             |
+//|   3. RSI diverging from price (momentum not confirming)          |
+//|   4. Volume below average (institutions not participating)       |
+//| Returns true if the continuation looks FALSE and should be       |
+//| blocked.  Requires FalseSweepMinFails (default 2) to trigger.    |
+//+------------------------------------------------------------------+
+bool IsFalseSweepContinuation(string direction, double sweepLevel)
+{
+   if(!EnableFalseSweepFilter) return false;
+
+   int    failCount = 0;
+   double pipSize   = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double price     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // --- Filter 1: Travel Distance ---
+   double travelPips = MathAbs(price - sweepLevel) / pipSize;
+   if(travelPips > MaxTravelFromSweepPips)
+   {
+      Print("FalseSweep [1] ✗ | Travel: ", DoubleToString(travelPips, 1),
+            " pips from sweep (max ", DoubleToString(MaxTravelFromSweepPips, 0), ")");
+      failCount++;
+   }
+   else
+      Print("FalseSweep [1] ✓ | Travel: ", DoubleToString(travelPips, 1), " pips — within range");
+
+   // --- Filter 2: EMA Extension ---
+   double emaSlBuf[];
+   ArraySetAsSeries(emaSlBuf, true);
+   double atrBuf2[];
+   ArraySetAsSeries(atrBuf2, true);
+   if(CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlBuf) > 0 &&
+      CopyBuffer(atrHandle, 0, 0, 1, atrBuf2) > 0 && atrBuf2[0] > 0)
+   {
+      double emaDistance = MathAbs(price - emaSlBuf[0]);
+      double atrUnits   = emaDistance / atrBuf2[0];
+      if(atrUnits > MaxEMAExtensionATR)
+      {
+         Print("FalseSweep [2] ✗ | EMA extension: ", DoubleToString(atrUnits, 2),
+               " ATR from EMA26 (max ", DoubleToString(MaxEMAExtensionATR, 1), ")");
+         failCount++;
+      }
+      else
+         Print("FalseSweep [2] ✓ | EMA extension: ", DoubleToString(atrUnits, 2), " ATR — OK");
+   }
+
+   // --- Filter 3: RSI Divergence ---
+   double rsiBufDiv[];
+   ArraySetAsSeries(rsiBufDiv, true);
+   MqlRates divRates[];
+   ArraySetAsSeries(divRates, true);
+   if(CopyBuffer(rsiHandle, 0, 0, RSIDivergenceBars, rsiBufDiv) >= RSIDivergenceBars &&
+      CopyRates(_Symbol, PERIOD_M5, 0, RSIDivergenceBars, divRates) >= RSIDivergenceBars)
+   {
+      int last = RSIDivergenceBars - 1;
+      bool diverging = false;
+      if(direction == "BUY")
+      {
+         if(divRates[0].close > divRates[last].close && rsiBufDiv[0] < rsiBufDiv[last])
+            diverging = true;
+      }
+      else
+      {
+         if(divRates[0].close < divRates[last].close && rsiBufDiv[0] > rsiBufDiv[last])
+            diverging = true;
+      }
+
+      if(diverging)
+      {
+         Print("FalseSweep [3] ✗ | RSI divergence — momentum not confirming price");
+         failCount++;
+      }
+      else
+         Print("FalseSweep [3] ✓ | No RSI divergence — momentum aligned");
+   }
+
+   // --- Filter 4: Volume Fade ---
+   long volBufFS[];
+   ArraySetAsSeries(volBufFS, true);
+   if(CopyTickVolume(_Symbol, PERIOD_M5, 0, VolumePeriod + 1, volBufFS) >= VolumePeriod + 1)
+   {
+      double avgVol = 0;
+      for(int i = 1; i <= VolumePeriod; i++) avgVol += (double)volBufFS[i];
+      avgVol /= VolumePeriod;
+      double volRatio = (avgVol > 0) ? (double)volBufFS[0] / avgVol : 0;
+      if(volRatio < MinContinuationVolRatio)
+      {
+         Print("FalseSweep [4] ✗ | Volume fading: ", DoubleToString(volRatio, 2),
+               "x avg (need ", DoubleToString(MinContinuationVolRatio, 1), "x)");
+         failCount++;
+      }
+      else
+         Print("FalseSweep [4] ✓ | Volume: ", DoubleToString(volRatio, 2), "x avg — supported");
+   }
+
+   // --- Verdict ---
+   if(failCount >= FalseSweepMinFails)
+   {
+      Print("=== FALSE SWEEP CONTINUATION BLOCKED | ", failCount, "/4 exhaustion signals fired ===");
+      return true;
+   }
+
+   Print("FalseSweep ✓ | Only ", failCount, "/4 failed — continuation valid");
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| Dynamic spread check relative to nearest Fib distance            |
 //+------------------------------------------------------------------+
 bool CheckDynamicSpread(double nearestFib)
@@ -1182,6 +1299,11 @@ void OnTick()
       // ride the move rather than only ever catching mean-reversions.
       else if(EnableContinuation && CheckSweepContinuation(direction, sweepLevel, gapTop, gapBottom, fvgBarsAgo))
       {
+         if(IsFalseSweepContinuation(direction, sweepLevel))
+         {
+            Print("Signal: HOLD | Sweep continuation blocked — exhaustion detected");
+            return;
+         }
          isOverride   = true;
          overrideMode = "CONTINUATION";
          Print("=== SWEEP+CONTINUATION OVERRIDE | ORCH said HOLD, taking ", direction,
