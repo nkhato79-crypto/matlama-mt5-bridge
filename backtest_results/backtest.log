@@ -1,0 +1,48 @@
+2026-07-22 11:08:27,794 | INFO | 
+============================================================
+2026-07-22 11:08:27,794 | INFO | COMPARISON: Fixed Lots vs Dynamic Position Sizing
+2026-07-22 11:08:27,795 | INFO | ============================================================
+2026-07-22 11:08:27,795 | INFO | 
+--- Fixed Lots (0.01) ---
+2026-07-22 11:08:27,795 | INFO | ============================================================
+2026-07-22 11:08:27,795 | INFO | MATLAMA QUANT ECOSYSTEM — PORTFOLIO BACKTEST
+2026-07-22 11:08:27,795 | INFO | ============================================================
+2026-07-22 11:08:28,638 | ERROR | Failed to get ticker 'GC=F' reason: Failed to perform, curl: (56) CONNECT tunnel failed, response 403. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+2026-07-22 11:08:29,079 | ERROR | 
+1 Failed download:
+2026-07-22 11:08:29,079 | ERROR | ['GC=F']: ProxyError('Failed to perform, curl: (56) CONNECT tunnel failed, response 403. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.')
+2026-07-22 11:08:29,138 | INFO | Generated 2256 synthetic H1 bars | Price range: $2336 - $2750
+2026-07-22 11:08:29,138 | INFO | Computing indicators...
+2026-07-22 11:08:29,149 | INFO | Active strategies: ['SCALPER', 'QUANT', 'HFT', 'ORB', 'TICK_SCALPER']
+2026-07-22 11:08:29,149 | INFO | Lot mode: fixed | Initial balance: $10,000
+2026-07-22 11:08:29,149 | INFO | Processing 2206 bars (skipping 50 warmup)...
+2026-07-22 11:08:30,389 | INFO | 
+--- Dynamic Lots (1% equity risk) ---
+2026-07-22 11:08:30,389 | INFO | ============================================================
+2026-07-22 11:08:30,389 | INFO | MATLAMA QUANT ECOSYSTEM — PORTFOLIO BACKTEST
+2026-07-22 11:08:30,389 | INFO | ============================================================
+2026-07-22 11:08:30,736 | ERROR | Failed to get ticker 'GC=F' reason: Failed to perform, curl: (56) CONNECT tunnel failed, response 403. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+2026-07-22 11:08:31,154 | ERROR | 
+1 Failed download:
+2026-07-22 11:08:31,155 | ERROR | ['GC=F']: ProxyError('Failed to perform, curl: (56) CONNECT tunnel failed, response 403. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.')
+2026-07-22 11:08:31,219 | INFO | Generated 2256 synthetic H1 bars | Price range: $2336 - $2750
+2026-07-22 11:08:31,219 | INFO | Computing indicators...
+2026-07-22 11:08:31,231 | INFO | Active strategies: ['SCALPER', 'QUANT', 'HFT', 'ORB', 'TICK_SCALPER']
+2026-07-22 11:08:31,231 | INFO | Lot mode: dynamic | Initial balance: $10,000
+2026-07-22 11:08:31,231 | INFO | Processing 2206 bars (skipping 50 warmup)...
+2026-07-22 11:08:32,540 | INFO | 
+--- Dynamic Lots + 3-Position Limit ---
+2026-07-22 11:08:32,541 | INFO | ============================================================
+2026-07-22 11:08:32,541 | INFO | MATLAMA QUANT ECOSYSTEM — PORTFOLIO BACKTEST
+2026-07-22 11:08:32,541 | INFO | ============================================================
+2026-07-22 11:08:32,971 | ERROR | Failed to get ticker 'GC=F' reason: Failed to perform, curl: (56) CONNECT tunnel failed, response 403. See https://curl.se/libcurl/c/libcurl-errors.html first for more details.
+2026-07-22 11:08:32,971 | ERROR | $GC=F: possibly delisted; no timezone found
+2026-07-22 11:08:32,981 | ERROR | 
+1 Failed download:
+2026-07-22 11:08:32,981 | ERROR | ['GC=F']: possibly delisted; no timezone found
+2026-07-22 11:08:33,034 | INFO | Generated 2256 synthetic H1 bars | Price range: $2336 - $2750
+2026-07-22 11:08:33,034 | INFO | Computing indicators...
+2026-07-22 11:08:33,044 | INFO | Active strategies: ['SCALPER', 'QUANT', 'HFT', 'ORB', 'TICK_SCALPER']
+2026-07-22 11:08:33,044 | INFO | Lot mode: dynamic | Initial balance: $10,000
+2026-07-22 11:08:33,045 | INFO | Max concurrent positions: 3
+2026-07-22 11:08:33,045 | INFO | Processing 2206 bars (skipping 50 warmup)...
