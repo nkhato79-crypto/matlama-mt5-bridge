@@ -11,11 +11,13 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
 
 //--- Core Parameters
 input string   EA_Name          = "MatlamaTickScalper v2";
 input double   LotSize          = 0.01;
-input int      MagicNumber      = 20260103;
+input double   RiskPercent      = 1.0;         // % of equity risked per trade (0 = use fixed LotSize)
+input int      MagicNumber      = 20260104;
 input int      MaxHoldSeconds   = 300;         // 5 min max hold
 input int      MaxTradesPerDay  = 20;          // quality over quantity
 input double   MaxDailyLoss     = 50.0;        // account-currency cap
@@ -308,18 +310,19 @@ void CheckEntry()
    entrySpread    = spread;
    entryVWAPSlope = vwapSlope;
 
+   double lot = CalcDynamicLot(_Symbol, sl_pips, RiskPercent, LotSize);
    bool success = false;
    if(direction == "BUY")
    {
       double sl = NormalizeDouble(ask - sl_dist, digits);
       double tp = NormalizeDouble(ask + tp_dist, digits);
-      success   = trade.Buy(LotSize, _Symbol, 0, sl, tp, EA_Name);
+      success   = trade.Buy(lot, _Symbol, 0, sl, tp, EA_Name);
    }
    else
    {
       double sl = NormalizeDouble(bid + sl_dist, digits);
       double tp = NormalizeDouble(bid - tp_dist, digits);
-      success   = trade.Sell(LotSize, _Symbol, 0, sl, tp, EA_Name);
+      success   = trade.Sell(lot, _Symbol, 0, sl, tp, EA_Name);
    }
 
    if(success)
@@ -333,6 +336,7 @@ void CheckEntry()
             " adx=", DoubleToString(cachedADX, 1),
             " tp=", DoubleToString(tp_pips, 1),
             " sl=", DoubleToString(sl_pips, 1),
+            " lot=", DoubleToString(lot, 2),
             " spread=", DoubleToString(spread, 1));
    }
    else

@@ -13,6 +13,7 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "DynamicLot.mqh"
 CTrade trade;
 
 //--- Identity
@@ -29,6 +30,7 @@ input int    BreakoutValidMins = 180;        // How long after range closes a br
 
 //--- Risk settings
 input double LotSize           = 0.01;
+input double RiskPercent       = 1.0;        // % of equity risked per trade (0 = use fixed LotSize)
 input double SLBufferPips      = 5.0;        // Extra buffer beyond range boundary for SL
 input double RR_Multiple       = 2.0;        // TP = range size * this multiple
 input int    MaxTradesPerDay   = 4;          // Across both sessions combined (2 sessions x long/short)
@@ -182,11 +184,14 @@ void CheckBreakoutEntries(int s)
    {
       double sl = rangeLow[s] - buffer;
       double tp = ask + (rangeSize * RR_Multiple);
+      double sl_pips_long = (ask - sl) / (point * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips_long, RiskPercent, LotSize);
       trade.SetExpertMagicNumber(MagicORB);
-      if(trade.Buy(LotSize, _Symbol, ask, sl, tp, EA_Name + " " + sessionLabel[s] + " long"))
+      if(trade.Buy(lot, _Symbol, ask, sl, tp, EA_Name + " " + sessionLabel[s] + " long"))
       {
          longTaken[s] = true;
-         Print(EA_Name, " | ", sessionLabel[s], " LONG breakout @", ask, " SL:", sl, " TP:", tp);
+         Print(EA_Name, " | ", sessionLabel[s], " LONG breakout @", ask,
+               " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       }
    }
 
@@ -194,11 +199,14 @@ void CheckBreakoutEntries(int s)
    {
       double sl = rangeHigh[s] + buffer;
       double tp = bid - (rangeSize * RR_Multiple);
+      double sl_pips_short = (sl - bid) / (point * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips_short, RiskPercent, LotSize);
       trade.SetExpertMagicNumber(MagicORB);
-      if(trade.Sell(LotSize, _Symbol, bid, sl, tp, EA_Name + " " + sessionLabel[s] + " short"))
+      if(trade.Sell(lot, _Symbol, bid, sl, tp, EA_Name + " " + sessionLabel[s] + " short"))
       {
          shortTaken[s] = true;
-         Print(EA_Name, " | ", sessionLabel[s], " SHORT breakdown @", bid, " SL:", sl, " TP:", tp);
+         Print(EA_Name, " | ", sessionLabel[s], " SHORT breakdown @", bid,
+               " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       }
    }
 }

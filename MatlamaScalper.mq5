@@ -9,10 +9,12 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaScalper v1";
 input double   LotSize        = 0.01;
+input double   RiskPercent    = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      SL_Pips        = 15;
 input int      TP_Pips        = 20;
 input int      Slippage       = 10;
@@ -343,9 +345,10 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "SCALP_BUY");
+      double lot = CalcDynamicLot(_Symbol, (double)SL_Pips, RiskPercent, LotSize);
+      success    = trade.Buy(lot, _Symbol, 0, sl, tp, "SCALP_BUY");
       if(success)
-         Print("SCALP BUY | Ask:", ask, " SL:", sl, " TP:", tp);
+         Print("SCALP BUY | Ask:", ask, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       else
          Print("SCALP BUY failed: ", trade.ResultRetcodeDescription());
    }
@@ -354,9 +357,10 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "SCALP_SELL");
+      double lot = CalcDynamicLot(_Symbol, (double)SL_Pips, RiskPercent, LotSize);
+      success    = trade.Sell(lot, _Symbol, 0, sl, tp, "SCALP_SELL");
       if(success)
-         Print("SCALP SELL | Bid:", bid, " SL:", sl, " TP:", tp);
+         Print("SCALP SELL | Bid:", bid, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       else
          Print("SCALP SELL failed: ", trade.ResultRetcodeDescription());
    }

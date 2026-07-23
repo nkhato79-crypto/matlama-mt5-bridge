@@ -78,6 +78,8 @@ ANALYST_INTERVAL = 3600       # 1 hour
 MODEL_STALE_HOURS = 48
 ALERT_COOLDOWN = 900          # 15 min between duplicate alerts
 DAILY_SUMMARY_HOUR_UTC = 22   # 00:00 SAST
+SUPERVISOR_INTERVAL = 60      # check supervised processes every 60s
+SUPERVISOR_MAX_RESTARTS = 5   # max restarts before giving up
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -386,18 +388,20 @@ class CommanderBot:
         "`/performance`  — 7-day performance\n"
         "`/performance30`  — 30-day performance\n"
         "`/models`  — ML model status\n"
+        "`/supervisor`  — Process supervisor status\n"
         "`/pulse`  — EventPulse status\n"
         "`/full`  — Full system report\n"
         "`/chatid`  — Show your Chat ID\n"
         "`/help`  — This message"
     )
 
-    def __init__(self, tg, chat_id, sentinel, analyst, trainer, log):
+    def __init__(self, tg, chat_id, sentinel, analyst, trainer, log, supervisor=None):
         self.tg = tg
         self.chat_id = chat_id
         self.sentinel = sentinel
         self.analyst = analyst
         self.trainer = trainer
+        self.supervisor = supervisor
         self.log = log
 
     def handle(self, update):
@@ -416,6 +420,7 @@ class CommanderBot:
             "/performance": self._performance,
             "/performance30": self._performance30,
             "/models": self._models,
+            "/supervisor": self._supervisor,
             "/pulse": self._pulse,
             "/full": self._full,
             "/chatid": self._chatid,
@@ -451,6 +456,11 @@ class CommanderBot:
     def _models(self, _):
         return self.trainer.format_status()
 
+    def _supervisor(self, _):
+        if self.supervisor:
+            return self.supervisor.format_status()
+        return "⚠️ Process supervisor not initialized."
+
     def _pulse(self, _):
         if not EVENTPULSE_URL:
             return "⚠️ EventPulse URL not configured."
@@ -479,6 +489,8 @@ class CommanderBot:
             "",
             self.trainer.format_status(),
         ]
+        if self.supervisor:
+            parts += ["", self.supervisor.format_status()]
         return "\n".join(parts)
 
     def _chatid(self, cid):
@@ -492,6 +504,129 @@ class CommanderBot:
 
 
 # ---------------------------------------------------------------------------
+# Process Supervisor - Auto-restart critical services
+# ---------------------------------------------------------------------------
+class ProcessSupervisor:
+    """Monitors and restarts Python services that should always be running."""
+
+    MANAGED_PROCESSES = {
+        "orchestrator": {
+            "script": os.path.join(BASE_DIR, "orchestrator_v2.py"),
+            "health_url": f"{ORCHESTRATOR_URL}/heartbeat",
+            "display": "Orchestrator v2",
+        },
+        "threshold": {
+            "script": os.path.join(BASE_DIR, "threshold_server_v2.py"),
+            "health_url": f"{THRESHOLD_URL}/",
+            "display": "Threshold Server",
+        },
+        "bridge": {
+            "script": os.path.join(BASE_DIR, "flask_mt5_bridge.py"),
+            "health_url": f"{BRIDGE_URL}/health",
+            "display": "MT5 Bridge",
+        },
+    }
+
+    def __init__(self, tg, chat_id, log):
+        self.tg = tg
+        self.chat_id = chat_id
+        self.log = log
+        self.processes = {}
+        self.restart_counts = {k: 0 for k in self.MANAGED_PROCESSES}
+        self.enabled = True
+
+    def _is_healthy(self, name):
+        cfg = self.MANAGED_PROCESSES[name]
+        try:
+            r = http_requests.get(cfg["health_url"], timeout=5)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def _start_process(self, name):
+        import subprocess
+        cfg = self.MANAGED_PROCESSES[name]
+        script = cfg["script"]
+        if not os.path.exists(script):
+            self.log.warning("Supervisor: %s script not found at %s", name, script)
+            return False
+
+        try:
+            python_exe = sys.executable
+            proc = subprocess.Popen(
+                [python_exe, script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self.processes[name] = proc
+            self.restart_counts[name] += 1
+            self.log.info("Supervisor: Started %s (PID %d, restart #%d)",
+                          name, proc.pid, self.restart_counts[name])
+            return True
+        except Exception as exc:
+            self.log.error("Supervisor: Failed to start %s: %s", name, exc)
+            return False
+
+    def check_and_restart(self):
+        if not self.enabled:
+            return
+
+        for name, cfg in self.MANAGED_PROCESSES.items():
+            if self.restart_counts[name] >= SUPERVISOR_MAX_RESTARTS:
+                continue
+
+            if self._is_healthy(name):
+                continue
+
+            proc = self.processes.get(name)
+            if proc and proc.poll() is None:
+                continue
+
+            self.log.warning("Supervisor: %s is DOWN, attempting restart...", cfg["display"])
+            if self._start_process(name):
+                msg = (f"🔄 *{cfg['display']}* was down — restarted "
+                       f"(attempt {self.restart_counts[name]}/{SUPERVISOR_MAX_RESTARTS})")
+            else:
+                msg = f"❌ *{cfg['display']}* is down and could not be restarted"
+
+            if self.tg and self.chat_id:
+                self.tg.send(self.chat_id, msg)
+
+            if self.restart_counts[name] >= SUPERVISOR_MAX_RESTARTS:
+                exhausted_msg = (f"🛑 *{cfg['display']}* has exhausted restart attempts "
+                                 f"({SUPERVISOR_MAX_RESTARTS}). Manual intervention needed.")
+                if self.tg and self.chat_id:
+                    self.tg.send(self.chat_id, exhausted_msg)
+                self.log.error("Supervisor: %s exhausted restart limit", name)
+
+    def stop_all(self):
+        for name, proc in self.processes.items():
+            if proc and proc.poll() is None:
+                self.log.info("Supervisor: Stopping %s (PID %d)", name, proc.pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
+
+    def format_status(self):
+        lines = ["*🔧 Process Supervisor*", ""]
+        for name, cfg in self.MANAGED_PROCESSES.items():
+            healthy = self._is_healthy(name)
+            icon = "🟢" if healthy else "🔴"
+            restarts = self.restart_counts[name]
+            proc = self.processes.get(name)
+            pid_str = f"PID {proc.pid}" if proc and proc.poll() is None else "external"
+            lines.append(f"{icon} *{cfg['display']}*: {'UP' if healthy else 'DOWN'} ({pid_str})")
+            if restarts > 0:
+                lines.append(f"   Restarts: {restarts}/{SUPERVISOR_MAX_RESTARTS}")
+        if not self.enabled:
+            lines.append("\n⚠️ Supervisor disabled")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Swarm Orchestrator
 # ---------------------------------------------------------------------------
 class MatlamaSwarm:
@@ -501,8 +636,10 @@ class MatlamaSwarm:
         self.sentinel = SentinelBot(self.tg, TELEGRAM_CHAT_ID, self.log)
         self.analyst = AnalystBot(self.log)
         self.trainer = TrainerBot(self.log)
+        self.supervisor = ProcessSupervisor(self.tg, TELEGRAM_CHAT_ID, self.log)
         self.commander = (
-            CommanderBot(self.tg, TELEGRAM_CHAT_ID, self.sentinel, self.analyst, self.trainer, self.log)
+            CommanderBot(self.tg, TELEGRAM_CHAT_ID, self.sentinel, self.analyst,
+                         self.trainer, self.log, self.supervisor)
             if self.tg
             else None
         )
@@ -524,10 +661,18 @@ class MatlamaSwarm:
         last_sentinel = time.time()
         last_trainer = 0.0
         last_analyst = 0.0
+        last_supervisor = 0.0
         last_daily = ""
 
         while self.running:
             now = time.time()
+
+            if now - last_supervisor >= SUPERVISOR_INTERVAL:
+                try:
+                    self.supervisor.check_and_restart()
+                except Exception as exc:
+                    self.log.error("Supervisor: %s", exc)
+                last_supervisor = now
 
             if now - last_sentinel >= SENTINEL_INTERVAL:
                 try:
@@ -590,6 +735,7 @@ class MatlamaSwarm:
     def stop(self, *_):
         self.log.info("Swarm shutting down")
         self.running = False
+        self.supervisor.stop_all()
         if self.tg and TELEGRAM_CHAT_ID:
             self.tg.send(TELEGRAM_CHAT_ID, "🔴 Matlama Swarm Commander shutting down.")
 

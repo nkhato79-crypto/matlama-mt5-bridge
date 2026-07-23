@@ -9,10 +9,12 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaBridge v5";
 input double   LotSize        = 0.01;
+input double   RiskPercent    = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      SL_Pips        = 50;
 input int      TP_Pips        = 100;
 input int      Slippage       = 10;
@@ -366,6 +368,7 @@ void OnTick()
    double pipSize = point * 10;
    double sl_dist = SL_Pips * pipSize;
    double tp_dist = TP_Pips * pipSize;
+   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, RiskPercent, LotSize);
    bool   success = false;
 
    if(action == "BUY")
@@ -373,8 +376,8 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "MB_BUY");
-      if(success) Print("BUY executed | Ask:", ask, " SL:", sl, " TP:", tp);
+      success    = trade.Buy(lot, _Symbol, 0, sl, tp, "MB_BUY");
+      if(success) Print("BUY executed | Ask:", ask, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       else        Print("BUY failed: ", trade.ResultRetcodeDescription());
    }
    else if(action == "SELL")
@@ -382,8 +385,8 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "MB_SELL");
-      if(success) Print("SELL executed | Bid:", bid, " SL:", sl, " TP:", tp);
+      success    = trade.Sell(lot, _Symbol, 0, sl, tp, "MB_SELL");
+      if(success) Print("SELL executed | Bid:", bid, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       else        Print("SELL failed: ", trade.ResultRetcodeDescription());
    }
 

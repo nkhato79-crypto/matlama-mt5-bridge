@@ -10,10 +10,12 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaQuant v1";
 input double   LotSize         = 0.01;
+input double   RiskPercent     = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      MagicNumber     = 20260201;
 input int      SL_Buffer       = 10;        // pips beyond Fib level for SL
 input int      PollSeconds     = 10;        // faster poll for reactive entries
@@ -1362,11 +1364,14 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
-      success = trade.Buy(LotSize, _Symbol, 0, sl, tp1, "MQ_BUY" + tradeComment);
+      double sl_pips = MathAbs(ask - sl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips, RiskPercent, LotSize);
+      success = trade.Buy(lot, _Symbol, 0, sl, tp1, "MQ_BUY" + tradeComment);
       if(success)
       {
          Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib, sourceTag);
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
+               " Lot:", DoubleToString(lot, 2), sourceTag);
          EntryTime = TimeCurrent();
       }
       else Print("BUY failed: ", trade.ResultRetcodeDescription());
@@ -1376,11 +1381,14 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
-      success = trade.Sell(LotSize, _Symbol, 0, sl, tp1, "MQ_SELL" + tradeComment);
+      double sl_pips = MathAbs(sl - bid) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips, RiskPercent, LotSize);
+      success = trade.Sell(lot, _Symbol, 0, sl, tp1, "MQ_SELL" + tradeComment);
       if(success)
       {
          Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib, sourceTag);
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
+               " Lot:", DoubleToString(lot, 2), sourceTag);
          EntryTime = TimeCurrent();
       }
       else Print("SELL failed: ", trade.ResultRetcodeDescription());

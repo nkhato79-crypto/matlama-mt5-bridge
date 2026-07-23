@@ -422,6 +422,44 @@ def health():
 
 
 # =========================================================
+# HEARTBEAT / WATCHDOG
+# =========================================================
+_heartbeat_lock = threading.Lock()
+_last_heartbeat = datetime.utcnow()
+
+
+def _update_heartbeat():
+    global _last_heartbeat
+    with _heartbeat_lock:
+        _last_heartbeat = datetime.utcnow()
+
+
+def _get_heartbeat():
+    with _heartbeat_lock:
+        return _last_heartbeat
+
+
+@app.before_request
+def _touch_heartbeat():
+    _update_heartbeat()
+
+
+@app.route("/heartbeat", methods=["GET"])
+def heartbeat():
+    last = _get_heartbeat()
+    age = (datetime.utcnow() - last).total_seconds()
+    return jsonify({
+        "alive": True,
+        "last_activity": last.isoformat() + "Z",
+        "idle_seconds": round(age, 1),
+        "uptime_seconds": round((datetime.utcnow() - _startup_time).total_seconds(), 1),
+    })
+
+
+_startup_time = datetime.utcnow()
+
+
+# =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":

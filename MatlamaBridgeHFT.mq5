@@ -11,10 +11,12 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaBridgeHFT v2";
 input double   LotSize         = 0.01;
+input double   RiskPercent     = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      MagicNumber     = 20260102;
 input int      SL_Pips         = 30;           // tighter SL for HFT
 input int      TP_Pips         = 60;           // 1:2 RR minimum
@@ -621,6 +623,7 @@ void OnTick()
 
    double sl_dist = SL_Pips * pipSize;
    double tp_dist = TP_Pips * pipSize;
+   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, RiskPercent, LotSize);
    bool   success = false;
 
    if(direction == "BUY")
@@ -628,11 +631,12 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "HFT_BUY");
+      success    = trade.Buy(lot, _Symbol, 0, sl, tp, "HFT_BUY");
       if(success)
       {
          dailyTradeCount++;
          Print("HFT BUY | Ask:", ask, " SL:", sl, " TP:", tp,
+               " Lot:", DoubleToString(lot, 2),
                " | Type:", signalType, " Fib:", nearestFib);
       }
       else Print("HFT BUY failed: ", trade.ResultRetcodeDescription());
@@ -642,11 +646,12 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "HFT_SELL");
+      success    = trade.Sell(lot, _Symbol, 0, sl, tp, "HFT_SELL");
       if(success)
       {
          dailyTradeCount++;
          Print("HFT SELL | Bid:", bid, " SL:", sl, " TP:", tp,
+               " Lot:", DoubleToString(lot, 2),
                " | Type:", signalType, " Fib:", nearestFib);
       }
       else Print("HFT SELL failed: ", trade.ResultRetcodeDescription());
