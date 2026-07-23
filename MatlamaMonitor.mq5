@@ -157,21 +157,22 @@ void OnStart()
    Print("###  Run time: ", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), "  ###");
    Print("###########################################");
 
-   EAStats stats[5];
+   EAStats stats[6];
    ReadEACsv("quant_trades.csv",    "MatlamaQuant",       stats[0]);
    ReadEACsv("bridgev3_trades.csv", "matlamabridgeV3",    stats[1]);
    ReadEACsv("hft_trades.csv",      "MatlamaBridgeHFT",   stats[2]);
    ReadEACsv("scalper_trades.csv",  "MatlamaScalper",     stats[3]);
+   ReadEACsv("looper_trades.csv",   "MatlamaLooper",      stats[4]);
    // MatlamaFundamentals: no CSV file exists in the current codebase.
-   stats[4].name = "MatlamaFundamentals";
-   stats[4].file = "(none)";
-   stats[4].found = false;
-   stats[4].trades = 0;
+   stats[5].name = "MatlamaFundamentals";
+   stats[5].file = "(none)";
+   stats[5].found = false;
+   stats[5].trades = 0;
 
    double portfolioTotal = 0.0;
    int portfolioTrades = 0;
 
-   for(int i = 0; i < 5; i++)
+   for(int i = 0; i < 6; i++)
    {
       PrintEAStats(stats[i]);
       portfolioTotal += stats[i].totalProfit;
@@ -183,6 +184,6 @@ void OnStart()
    Print("=========================================");
 
    if(WriteSummaryCSV)
-      WriteSummaryFile(stats, 5);
+      WriteSummaryFile(stats, 6);
 }
 //+------------------------------------------------------------------+

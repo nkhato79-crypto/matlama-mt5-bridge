@@ -74,6 +74,7 @@ quant_model,   quant_scaler,   QUANT_AVAILABLE   = load_pair("quant_model.pkl", 
 mbv3_model,    mbv3_scaler,    MBV3_AVAILABLE    = load_pair("rf_model.pkl",      "scaler.pkl",         "MBV3 (BridgeV3)")
 hft_model,     hft_scaler,     HFT_AVAILABLE     = load_pair("hft_model.pkl",     "hft_scaler.pkl",     "HFT")
 scalper_model, scalper_scaler, SCALPER_AVAILABLE = load_pair("scalper_model.pkl", "scalper_scaler.pkl", "SCALPER")
+looper_model,  looper_scaler,  LOOPER_AVAILABLE  = load_pair("looper_model.pkl",  "looper_scaler.pkl",  "LOOPER")
 
 STRATEGIES = {
     "QUANT":   {"model": quant_model,   "scaler": quant_scaler,   "available": QUANT_AVAILABLE,
@@ -87,6 +88,8 @@ STRATEGIES = {
                 "feature_order": ["wick_pips", "momentum_pips", "volume_ratio", "rsi"]},
     "SCALPER": {"model": scalper_model, "scaler": scalper_scaler, "available": SCALPER_AVAILABLE,
                 "feature_order": ["ema_diff_pips", "rsi", "momentum_pips"]},
+    "LOOPER":  {"model": looper_model, "scaler": looper_scaler, "available": LOOPER_AVAILABLE,
+                "feature_order": ["band_position", "range_width_pips", "rsi", "volume_ratio"]},
 }
 
 
