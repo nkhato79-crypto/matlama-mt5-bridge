@@ -11,6 +11,7 @@
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
 #include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaQuant v1";
@@ -1085,12 +1086,15 @@ int OnInit()
    CalculateFibLevels();
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",       _Symbol);
    Print("AutoTrade: ",    AutoTrade ? "ENABLED" : "DISABLED");
    Print("Magic: ",        MagicNumber);
    Print("Strategy: Fibonacci Reactive | 5-Layer Confirmation");
    Print("CSV: quant_trades.csv");
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -1124,6 +1128,9 @@ void OnTick()
       dailyResetTime    = TimeCurrent();
       Print("Daily balance reset: ", dailyStartBalance);
    }
+
+   // PropGuard tick-level checks (weekend close, emergency drawdown)
+   PropGuardOnTick();
 
    // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -1344,6 +1351,12 @@ void OnTick()
       Print("=== ORCHESTRATOR SIGNAL | Direction: ", direction,
             " | Confidence: ", DoubleToString(dec.confidence, 3), " ===");
 
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED trade | ", PropGuardStatus());
+      return;
+   }
+
    double sl, tp1, tp2, tp3;
    if(overrideMode == "RETEST")
       GetSweepFVGTradeLevels(direction, sweepLevel, gapTop, gapBottom, price, sl, tp1, tp2, tp3);
@@ -1365,10 +1378,11 @@ void OnTick()
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
       double sl_pips = MathAbs(ask - sl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
-      double lot = CalcDynamicLot(_Symbol, sl_pips, RiskPercent, LotSize);
+      double lot = CalcDynamicLot(_Symbol, sl_pips, PropGuardClampRisk(RiskPercent), LotSize);
       success = trade.Buy(lot, _Symbol, 0, sl, tp1, "MQ_BUY" + tradeComment);
       if(success)
       {
+         PropGuardOnTrade();
          Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1,
                " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
                " Lot:", DoubleToString(lot, 2), sourceTag);
@@ -1382,10 +1396,11 @@ void OnTick()
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
       double sl_pips = MathAbs(sl - bid) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
-      double lot = CalcDynamicLot(_Symbol, sl_pips, RiskPercent, LotSize);
+      double lot = CalcDynamicLot(_Symbol, sl_pips, PropGuardClampRisk(RiskPercent), LotSize);
       success = trade.Sell(lot, _Symbol, 0, sl, tp1, "MQ_SELL" + tradeComment);
       if(success)
       {
+         PropGuardOnTrade();
          Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1,
                " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
                " Lot:", DoubleToString(lot, 2), sourceTag);

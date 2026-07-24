@@ -14,6 +14,7 @@
 
 #include <Trade\Trade.mqh>
 #include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 CTrade trade;
 
 //--- Identity
@@ -85,10 +86,13 @@ int OnInit()
       }
    }
 
+   PropGuardInit();
+
    Print(EA_Name, " initialized | Magic:", MagicORB,
          " | London ", LondonStartHour, ":", LondonStartMin,
          " | NY ", NYStartHour, ":", NYStartMin,
          " | Window:", RangeWindowMins, "min");
+   Print(PropGuardStatus());
    return(INIT_SUCCEEDED);
 }
 
@@ -179,16 +183,18 @@ void CheckBreakoutEntries(int s)
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    if(CountTradesToday() >= MaxTradesPerDay) return;
+   if(!PropGuardCanTrade()) return;
 
    if(!longTaken[s] && ask > rangeHigh[s])
    {
       double sl = rangeLow[s] - buffer;
       double tp = ask + (rangeSize * RR_Multiple);
       double sl_pips_long = (ask - sl) / (point * 10);
-      double lot = CalcDynamicLot(_Symbol, sl_pips_long, RiskPercent, LotSize);
+      double lot = CalcDynamicLot(_Symbol, sl_pips_long, PropGuardClampRisk(RiskPercent), LotSize);
       trade.SetExpertMagicNumber(MagicORB);
       if(trade.Buy(lot, _Symbol, ask, sl, tp, EA_Name + " " + sessionLabel[s] + " long"))
       {
+         PropGuardOnTrade();
          longTaken[s] = true;
          Print(EA_Name, " | ", sessionLabel[s], " LONG breakout @", ask,
                " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
@@ -200,10 +206,11 @@ void CheckBreakoutEntries(int s)
       double sl = rangeHigh[s] + buffer;
       double tp = bid - (rangeSize * RR_Multiple);
       double sl_pips_short = (sl - bid) / (point * 10);
-      double lot = CalcDynamicLot(_Symbol, sl_pips_short, RiskPercent, LotSize);
+      double lot = CalcDynamicLot(_Symbol, sl_pips_short, PropGuardClampRisk(RiskPercent), LotSize);
       trade.SetExpertMagicNumber(MagicORB);
       if(trade.Sell(lot, _Symbol, bid, sl, tp, EA_Name + " " + sessionLabel[s] + " short"))
       {
+         PropGuardOnTrade();
          shortTaken[s] = true;
          Print(EA_Name, " | ", sessionLabel[s], " SHORT breakdown @", bid,
                " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
@@ -289,6 +296,8 @@ void LogClosedTrades()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   PropGuardOnTick();
+
    ResetDailyStateIfNeeded(0, LondonStartHour, LondonStartMin);
    ResetDailyStateIfNeeded(1, NYStartHour, NYStartMin);
 

@@ -49,6 +49,7 @@ for %%f in (
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
     OrchestratorClient.mqh
+    PropFirmGuard.mqh
 ) do (
     if exist "%REPO_DIR%\%%f" (
         copy /y "%REPO_DIR%\%%f" "%MT5_EXPERTS%\%%f" >nul

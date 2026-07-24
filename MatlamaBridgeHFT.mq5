@@ -12,6 +12,7 @@
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
 #include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaBridgeHFT v2";
@@ -449,10 +450,13 @@ int OnInit()
    CalculateFibLevels();
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Strategy: Stop Hunt + Momentum Burst at Fibonacci levels");
    Print("Max trades/day: ", MaxTradesPerDay);
    Print("Spike threshold: ", SpikeThreshold, " pips");
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -486,6 +490,8 @@ void OnTick()
       dailyTradeCount   = 0;
       Print("HFT daily reset | Balance:", dailyStartBalance);
    }
+
+   PropGuardOnTick();
 
    // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -621,9 +627,15 @@ void OnTick()
          " | Confidence: ", DoubleToString(dec.confidence, 3),
          " | Regime: ", dec.regime, " | Price: ", price);
 
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED HFT trade | ", PropGuardStatus());
+      return;
+   }
+
    double sl_dist = SL_Pips * pipSize;
    double tp_dist = TP_Pips * pipSize;
-   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, RiskPercent, LotSize);
+   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, PropGuardClampRisk(RiskPercent), LotSize);
    bool   success = false;
 
    if(direction == "BUY")
@@ -634,6 +646,7 @@ void OnTick()
       success    = trade.Buy(lot, _Symbol, 0, sl, tp, "HFT_BUY");
       if(success)
       {
+         PropGuardOnTrade();
          dailyTradeCount++;
          Print("HFT BUY | Ask:", ask, " SL:", sl, " TP:", tp,
                " Lot:", DoubleToString(lot, 2),
@@ -649,6 +662,7 @@ void OnTick()
       success    = trade.Sell(lot, _Symbol, 0, sl, tp, "HFT_SELL");
       if(success)
       {
+         PropGuardOnTrade();
          dailyTradeCount++;
          Print("HFT SELL | Bid:", bid, " SL:", sl, " TP:", tp,
                " Lot:", DoubleToString(lot, 2),

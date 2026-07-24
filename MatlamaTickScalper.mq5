@@ -12,6 +12,7 @@
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
 #include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Core Parameters
 input string   EA_Name          = "MatlamaTickScalper v2";
@@ -114,11 +115,14 @@ int OnInit()
    currentDay = iTime(_Symbol, PERIOD_D1, 0);
    InitCSV();
 
+   PropGuardInit();
+
    Print(EA_Name, " init | ", _Symbol,
          " pip=", pipSize,
          " VWAP=", VWAPBars, " bars",
          " entry=", DoubleToString(EntryBandMult, 1), "σ",
          " stop=", DoubleToString(StopBandMult, 1), "σ");
+   Print(PropGuardStatus());
    return INIT_SUCCEEDED;
 }
 
@@ -148,6 +152,8 @@ void OnTick()
       dailyPnL        = 0.0;
       currentDay      = today;
    }
+
+   PropGuardOnTick();
 
    // update cached indicators
    UpdateVWAP();
@@ -310,7 +316,13 @@ void CheckEntry()
    entrySpread    = spread;
    entryVWAPSlope = vwapSlope;
 
-   double lot = CalcDynamicLot(_Symbol, sl_pips, RiskPercent, LotSize);
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED tick scalp | ", PropGuardStatus());
+      return;
+   }
+
+   double lot = CalcDynamicLot(_Symbol, sl_pips, PropGuardClampRisk(RiskPercent), LotSize);
    bool success = false;
    if(direction == "BUY")
    {
@@ -327,6 +339,7 @@ void CheckEntry()
 
    if(success)
    {
+      PropGuardOnTrade();
       dailyTradeCount++;
       lastEntryTime = TimeCurrent();
       Print("VWAP SCALP ", direction,

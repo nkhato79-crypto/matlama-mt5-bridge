@@ -319,7 +319,7 @@ def risk_filter(f, regime):
     balance = f.get("balance")
     if equity is not None and balance is not None and balance > 0:
         drawdown_pct = 1 - (equity / balance)
-        max_dd_pct = f.get("max_account_drawdown_pct", 0.20)
+        max_dd_pct = f.get("max_account_drawdown_pct", 0.08)
         if drawdown_pct > max_dd_pct:
             return False, f"account drawdown {drawdown_pct:.2%} exceeds max {max_dd_pct:.2%}"
 

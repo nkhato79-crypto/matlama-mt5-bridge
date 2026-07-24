@@ -10,6 +10,7 @@
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
 #include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaBridge v5";
@@ -224,12 +225,15 @@ int OnInit()
 
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",     _Symbol);
    Print("AutoTrade: ",  AutoTrade ? "ENABLED" : "DISABLED");
    Print("COT Bias: ",   COT_Bias);
    Print("Threshold: ",  ScoreThreshold, "/9");
    Print("CSV Logging: ENABLED → ", CSV_PATH);
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -258,6 +262,8 @@ void OnTick()
       dailyResetTime    = TimeCurrent();
       Print("Daily balance reset: ", dailyStartBalance);
    }
+
+   PropGuardOnTick();
 
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
@@ -367,8 +373,14 @@ void OnTick()
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double pipSize = point * 10;
    double sl_dist = SL_Pips * pipSize;
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED trade | ", PropGuardStatus());
+      return;
+   }
+
    double tp_dist = TP_Pips * pipSize;
-   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, RiskPercent, LotSize);
+   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, PropGuardClampRisk(RiskPercent), LotSize);
    bool   success = false;
 
    if(action == "BUY")
@@ -392,6 +404,7 @@ void OnTick()
 
    if(success)
    {
+      PropGuardOnTrade();
       LastSignal = action;
       entryBuyScore  = EvaluateSignal("BUY");
       entrySellScore = EvaluateSignal("SELL");
