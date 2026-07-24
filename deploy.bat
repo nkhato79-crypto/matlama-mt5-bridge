@@ -68,10 +68,12 @@ echo [3/5] Compiling EAs in MetaEditor...
 
 if not exist %METAEDITOR% (
     echo      WARNING: MetaEditor not found at %METAEDITOR%
-    echo      You will need to compile manually in MetaEditor (F7 on each EA).
+    echo      You will need to compile manually in MetaEditor -- press F7 on each EA.
     echo      Skipping compilation...
     goto skip_compile
 )
+
+if not exist "%REPO_DIR%\logs" mkdir "%REPO_DIR%\logs"
 
 for %%f in (
     MatlamaQuant.mq5
@@ -92,14 +94,14 @@ echo      Done.
 
 REM Check for compile errors
 set COMPILE_ERRORS=0
-for %%f in (%REPO_DIR%\logs\compile_*.log) do (
+for %%f in ("%REPO_DIR%\logs\compile_*.log") do (
     findstr /i "error" "%%f" >nul 2>&1
     if not errorlevel 1 (
         echo      WARNING: Compile errors in %%~nxf
-        set COMPILE_ERRORS=1
+        set /a COMPILE_ERRORS=COMPILE_ERRORS+1
     )
 )
-if %COMPILE_ERRORS%==1 (
+if not %COMPILE_ERRORS%==0 (
     echo      Review compile logs before proceeding.
     echo.
 )
