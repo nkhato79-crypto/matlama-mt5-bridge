@@ -1,0 +1,27 @@
+{
+  "total_trades": 180,
+  "total_pnl": 1254.66,
+  "win_rate": 49.4,
+  "profit_factor": 1.09,
+  "sharpe_ratio": 0.61,
+  "sortino_ratio": 1.26,
+  "max_drawdown_pct": 26.69,
+  "calmar_ratio": 0.81,
+  "avg_win": 168.83,
+  "avg_loss": 151.33,
+  "win_loss_ratio": 1.12,
+  "max_concurrent_positions": 1,
+  "annual_return_pct": 21.72,
+  "initial_balance": 10000.0,
+  "final_balance": 11254.66,
+  "strategy_breakdown": {
+    "ORB": {
+      "trades": 180,
+      "win_rate": 49.4444,
+      "total_pnl": 1254.6561,
+      "avg_trade": 6.9703,
+      "best_trade": 519.5,
+      "worst_trade": -414.0
+    }
+  }
+}
