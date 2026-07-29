@@ -391,10 +391,12 @@ class QuantStrategy(BaseStrategy):
                 min_dist = dist
                 nearest_fib = fl
 
-        # Velocity: price change over 3 bars
+        # Velocity: signed price change over 3 bars (positive = price rising)
         velocity = 0
+        raw_velocity = 0
         if idx >= 3:
-            velocity = abs(df["close"].iloc[idx] - df["close"].iloc[idx - 3]) / POINT
+            raw_velocity = (df["close"].iloc[idx] - df["close"].iloc[idx - 3]) / POINT
+            velocity = abs(raw_velocity)
 
         rsi = ind["rsi"].iloc[idx]
         prev_rsi = ind["rsi"].iloc[idx - 1] if idx > 0 else rsi
@@ -414,6 +416,7 @@ class QuantStrategy(BaseStrategy):
         return {
             "fib_level": nearest_fib,
             "velocity": velocity,
+            "raw_velocity": raw_velocity,
             "volume_ratio": vol_ratio,
             "rsi_accel": rsi_accel,
             "signal_score": score,
@@ -422,13 +425,20 @@ class QuantStrategy(BaseStrategy):
     def generate_signal(self, idx, df, ind, features):
         if features["signal_score"] < 3:
             return None
+        if features["volume_ratio"] < 0.20:
+            return None
         close = df["close"].iloc[idx]
         ema = ind["ema21"].iloc[idx]
         if np.isnan(ema):
             return None
+        raw_vel = features["raw_velocity"]
         if close > ema and features["rsi_accel"] > 0:
+            if raw_vel > 0:
+                return None
             return "BUY"
         if close < ema and features["rsi_accel"] < 0:
+            if raw_vel < 0:
+                return None
             return "SELL"
         return None
 
@@ -578,6 +588,9 @@ class ORBStrategy(BaseStrategy):
         rh = features["range_high"]
         rl = features["range_low"]
         if rh <= 0 or rl <= 0:
+            return None
+        range_pips = (rh - rl) / POINT
+        if range_pips < 3.0:
             return None
 
         close = df["close"].iloc[idx]

@@ -83,6 +83,10 @@ input int      RSIDivergenceBars          = 5;     // M5 bars to check for momen
 input double   MinContinuationVolRatio    = 1.0;   // volume must be above average to confirm institutional flow
 input int      FalseSweepMinFails         = 2;     // block if this many exhaustion signals fire (out of 4)
 
+//--- Entry Quality Filters (forensic-derived: reversal signals must fade momentum)
+input bool     EnableVelocityFilter     = true;    // block momentum-aligned entries (counter-momentum wins 86%)
+input double   MinVolumeRatio           = 0.20;    // minimum volume ratio to confirm institutional participation
+
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck      = 0;
@@ -1260,11 +1264,13 @@ void OnTick()
 
    MqlRates fRates[]; ArraySetAsSeries(fRates, true);
    double velocityPips = 0;
+   double rawVelocityPips = 0;
    if(CopyRates(_Symbol, PERIOD_M1, 0, 5, fRates) >= 5)
    {
       double pipSizeV = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
-      if(dirGuess == "BUY") velocityPips = (fRates[0].close - fRates[2].close) / pipSizeV;
-      else                  velocityPips = (fRates[2].close - fRates[0].close) / pipSizeV;
+      rawVelocityPips = (fRates[0].close - fRates[2].close) / pipSizeV;
+      if(dirGuess == "BUY") velocityPips = rawVelocityPips;
+      else                  velocityPips = -rawVelocityPips;
    }
 
    long volBuf3[]; ArraySetAsSeries(volBuf3, true);
@@ -1397,6 +1403,29 @@ void OnTick()
    if(!PropGuardCanTrade())
    {
       Print("PropGuard BLOCKED trade | ", PropGuardStatus());
+      return;
+   }
+
+   if(EnableVelocityFilter)
+   {
+      if(direction == "BUY" && rawVelocityPips > 0)
+      {
+         Print("VELOCITY FILTER | BUY blocked — price rising (vel=", DoubleToString(rawVelocityPips, 1),
+               ") — reversal signals require counter-momentum entry");
+         return;
+      }
+      if(direction == "SELL" && rawVelocityPips < 0)
+      {
+         Print("VELOCITY FILTER | SELL blocked — price falling (vel=", DoubleToString(rawVelocityPips, 1),
+               ") — reversal signals require counter-momentum entry");
+         return;
+      }
+   }
+
+   if(volRatioLive < MinVolumeRatio)
+   {
+      Print("VOLUME FILTER | Blocked — vol ratio ", DoubleToString(volRatioLive, 2),
+            " < ", DoubleToString(MinVolumeRatio, 2));
       return;
    }
 

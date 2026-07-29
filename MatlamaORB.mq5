@@ -35,6 +35,9 @@ input double RiskPercent       = 1.0;        // % of equity risked per trade (0 
 input double SLBufferPips      = 5.0;        // Extra buffer beyond range boundary for SL
 input double RR_Multiple       = 2.0;        // TP = range size * this multiple
 input int    MaxTradesPerDay   = 4;          // Across both sessions combined (2 sessions x long/short)
+input double MinRangeSizePips = 3.0;        // Minimum range size to trade (filters noise breakouts)
+input int    EarliestTradeHour = 7;         // Block entries before this hour (UTC)
+input int    LatestTradeHour   = 20;        // Block entries at or after this hour (UTC)
 
 //--- CSV logging
 string   CSV_PATH = "orb_trades.csv";
@@ -186,6 +189,18 @@ void CheckBreakoutEntries(int s)
    double rangeSize = rangeHigh[s] - rangeLow[s];
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   MqlDateTime nowDt;
+   TimeToStruct(TimeGMT(), nowDt);
+   if(nowDt.hour < EarliestTradeHour || nowDt.hour >= LatestTradeHour) return;
+
+   double rangeSizePips = rangeSize / (point * 10);
+   if(rangeSizePips < MinRangeSizePips)
+   {
+      Print(EA_Name, " | ", sessionLabel[s], " range too narrow: ",
+            DoubleToString(rangeSizePips, 1), " pips (min ", MinRangeSizePips, ")");
+      return;
+   }
 
    if(CountTradesToday() >= MaxTradesPerDay) return;
    if(!PropGuardCanTrade()) return;
