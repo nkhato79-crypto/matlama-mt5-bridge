@@ -50,6 +50,7 @@ MT5_FILES = (
 
 TRADE_CSVS = {
     "ORB": os.path.join(MT5_FILES, "orb_trades.csv"),
+    "QUANT": os.path.join(MT5_FILES, "quant_trades.csv"),
 }
 
 MODEL_FILES = {

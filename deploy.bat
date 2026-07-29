@@ -1,8 +1,8 @@
 @echo off
 REM ================================================================
-REM  Matlama Deploy Script — ORB-Only Mode
-REM  Pulls latest code, copies MatlamaORB + support files to MT5,
-REM  restarts Swarm. All other strategies are cut.
+REM  Matlama Deploy Script — ORB + QUANT Mode
+REM  Pulls latest code, copies ORB + QUANT + support files to MT5,
+REM  restarts Swarm.
 REM ================================================================
 
 setlocal enabledelayedexpansion
@@ -17,7 +17,7 @@ set METAEDITOR="%MT5_TERMINAL%\metaeditor64.exe"
 
 echo.
 echo ========================================
-echo   Matlama Deploy — ORB-Only Mode
+echo   Matlama Deploy — ORB + QUANT Mode
 echo   %date% %time%
 echo ========================================
 echo.
@@ -36,14 +36,16 @@ if errorlevel 1 (
 echo      Done.
 echo.
 
-REM --- Step 2: Copy ORB + support files to MT5 ---
-echo [2/5] Copying ORB files to MetaTrader...
+REM --- Step 2: Copy ORB + QUANT + support files to MT5 ---
+echo [2/5] Copying EA files to MetaTrader...
 if not exist "%MT5_EXPERTS%" mkdir "%MT5_EXPERTS%"
 
 for %%f in (
     MatlamaORB.mq5
+    MatlamaQuant.mq5
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
+    OrchestratorClient.mqh
     DynamicLot.mqh
     PropFirmGuard.mqh
 ) do (
@@ -55,12 +57,12 @@ for %%f in (
 echo      Done.
 echo.
 
-REM --- Step 3: Compile ORB EA ---
-echo [3/5] Compiling MatlamaORB...
+REM --- Step 3: Compile EAs ---
+echo [3/5] Compiling EAs...
 
 if not exist %METAEDITOR% (
     echo      WARNING: MetaEditor not found at %METAEDITOR%
-    echo      Compile manually in MetaEditor -- press F7 on MatlamaORB.
+    echo      Compile manually in MetaEditor -- press F7 on each EA.
     echo      Skipping compilation...
     goto skip_compile
 )
@@ -69,6 +71,7 @@ if not exist "%REPO_DIR%\logs" mkdir "%REPO_DIR%\logs"
 
 for %%f in (
     MatlamaORB.mq5
+    MatlamaQuant.mq5
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
 ) do (
@@ -155,15 +158,14 @@ if %ALL_OK%==1 (
 )
 echo ========================================
 echo.
-echo  ORB-ONLY MODE: Only MatlamaORB should be
-echo  attached to charts. Remove all other EAs
-echo  from MT5 if still attached:
-echo    - MatlamaQuant
+echo  ORB + QUANT MODE: Attach MatlamaORB and
+echo  MatlamaQuant to your charts. Remove all
+echo  other EAs from MT5 if still attached:
 echo    - MatlamaScalper
 echo    - MatlamaTickScalper
 echo    - MatlamaBridgeHFT
 echo    - matlamabridgeV3
 echo.
-echo  Then restart MT5 or re-attach MatlamaORB.
+echo  Then restart MT5 or re-attach the EAs.
 echo.
 pause
