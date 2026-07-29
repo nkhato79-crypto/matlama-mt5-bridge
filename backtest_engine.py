@@ -95,11 +95,16 @@ class Trade:
 # ---------------------------------------------------------------------------
 # Data loading / generation
 # ---------------------------------------------------------------------------
-def load_real_data(months: int) -> Optional[pd.DataFrame]:
+def load_real_data(months: int = 6, start_date: str = None,
+                   end_date: str = None) -> Optional[pd.DataFrame]:
     try:
         import yfinance as yf
-        end = datetime.now()
-        start = end - timedelta(days=months * 30)
+        if start_date and end_date:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d")
+        else:
+            end = datetime.now()
+            start = end - timedelta(days=months * 30)
         df = yf.download("GC=F", start=start, end=end, interval="1h", progress=False)
         if len(df) < 100:
             return None
@@ -113,13 +118,24 @@ def load_real_data(months: int) -> Optional[pd.DataFrame]:
         return None
 
 
-def generate_synthetic_gold(months: int) -> pd.DataFrame:
+def generate_synthetic_gold(months: int = 6, start_date: str = None,
+                            end_date: str = None) -> pd.DataFrame:
     """
     Generate realistic XAUUSD H1 data using a mean-reverting jump-diffusion
     model calibrated to gold's actual statistical properties.
     """
     np.random.seed(42)
-    hours = months * 22 * 24  # ~22 trading days/month, 24 hours/day
+
+    if start_date and end_date:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        total_days = (end_dt - start_dt).days
+    else:
+        total_days = months * 30
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=total_days)
+
+    hours = int(total_days * 24)
 
     # Gold statistical properties (annualized)
     annual_vol = 0.18        # ~18% annual volatility
@@ -133,7 +149,7 @@ def generate_synthetic_gold(months: int) -> pd.DataFrame:
     prices = []
     volumes = []
 
-    start_time = datetime.now() - timedelta(hours=hours)
+    start_time = start_dt
     times = []
 
     for i in range(hours):
@@ -484,51 +500,93 @@ class HFTStrategy(BaseStrategy):
 class ORBStrategy(BaseStrategy):
     """Opening Range Breakout (MatlamaORB)"""
     def __init__(self):
-        super().__init__("ORB", max_trades_per_day=4, max_hold_hours=6)
+        super().__init__("ORB", max_trades_per_day=4, max_hold_hours=12)
         self.rr_multiple = 2.0
-        self.range_minutes = 30
-        self.range_high = None
-        self.range_low = None
-        self.range_session = None
+        self.sl_buffer_pips = 5.0
+        self.range_high = {0: None, 1: None}
+        self.range_low = {0: None, 1: None}
+        self.range_locked = {0: False, 1: False}
+        self.long_taken = {0: False, 1: False}
+        self.short_taken = {0: False, 1: False}
+        self.range_day = {0: None, 1: None}
+
+    def _reset_session(self, s, day):
+        if self.range_day[s] != day:
+            self.range_day[s] = day
+            self.range_high[s] = None
+            self.range_low[s] = None
+            self.range_locked[s] = False
+            self.long_taken[s] = False
+            self.short_taken[s] = False
 
     def compute_features(self, idx, df, ind):
+        t = df.index[idx]
+        hour = t.hour if hasattr(t, 'hour') else 12
+        day = t.date() if hasattr(t, 'date') else None
+
+        for s in (0, 1):
+            self._reset_session(s, day)
+
+        atr = ind["atr"].iloc[idx] if not np.isnan(ind["atr"].iloc[idx]) else 5.0
+
+        # Session 0 = London (8:00-8:30 range), Session 1 = NY (13:00-13:30 range)
+        # On H1 data: use the 8:00 bar for London, 13:00 bar for NY
+        if hour == 8 and not self.range_locked[0]:
+            self.range_high[0] = df["high"].iloc[idx]
+            self.range_low[0] = df["low"].iloc[idx]
+            rng = self.range_high[0] - self.range_low[0]
+            min_range = atr * 0.3
+            if rng < min_range:
+                mid = (self.range_high[0] + self.range_low[0]) / 2
+                self.range_high[0] = mid + min_range / 2
+                self.range_low[0] = mid - min_range / 2
+            self.range_locked[0] = True
+
+        if hour == 13 and not self.range_locked[1]:
+            self.range_high[1] = df["high"].iloc[idx]
+            self.range_low[1] = df["low"].iloc[idx]
+            rng = self.range_high[1] - self.range_low[1]
+            min_range = atr * 0.3
+            if rng < min_range:
+                mid = (self.range_high[1] + self.range_low[1]) / 2
+                self.range_high[1] = mid + min_range / 2
+                self.range_low[1] = mid - min_range / 2
+            self.range_locked[1] = True
+
+        active_session = None
+        active_rh = 0
+        active_rl = 0
+        if self.range_locked[0] and 9 <= hour <= 11:
+            active_session = 0
+            active_rh = self.range_high[0]
+            active_rl = self.range_low[0]
+        elif self.range_locked[1] and 14 <= hour <= 16:
+            active_session = 1
+            active_rh = self.range_high[1]
+            active_rl = self.range_low[1]
+
         return {
-            "range_high": self.range_high or 0,
-            "range_low": self.range_low or 0,
-            "session": self.range_session or "",
+            "range_high": active_rh,
+            "range_low": active_rl,
+            "session": active_session,
         }
 
     def generate_signal(self, idx, df, ind, features):
-        t = df.index[idx]
-        hour = t.hour if hasattr(t, 'hour') else 12
-
-        # Build opening range for London (8:00) or NY (13:30)
-        if hour == 8 and self.range_session != f"LONDON_{t.date()}":
-            # Use first bar as the opening range
-            self.range_high = df["high"].iloc[idx]
-            self.range_low = df["low"].iloc[idx]
-            self.range_session = f"LONDON_{t.date()}"
+        s = features["session"]
+        if s is None:
             return None
-
-        if hour == 14 and self.range_session != f"NY_{t.date()}":
-            self.range_high = df["high"].iloc[idx]
-            self.range_low = df["low"].iloc[idx]
-            self.range_session = f"NY_{t.date()}"
-            return None
-
-        if self.range_high is None or self.range_low is None:
+        rh = features["range_high"]
+        rl = features["range_low"]
+        if rh <= 0 or rl <= 0:
             return None
 
         close = df["close"].iloc[idx]
-        rng = self.range_high - self.range_low
 
-        if rng < 2 * POINT:
-            return None
-
-        # Breakout detection
-        if close > self.range_high + 2 * POINT:
+        if close > rh + 2 * POINT and not self.long_taken[s]:
+            self.long_taken[s] = True
             return "BUY"
-        if close < self.range_low - 2 * POINT:
+        if close < rl - 2 * POINT and not self.short_taken[s]:
+            self.short_taken[s] = True
             return "SELL"
         return None
 
@@ -536,11 +594,12 @@ class ORBStrategy(BaseStrategy):
         rng = features["range_high"] - features["range_low"]
         if rng < POINT:
             rng = atr
+        buffer = self.sl_buffer_pips * POINT
         if direction == "BUY":
-            sl = features["range_low"] - 5 * POINT
+            sl = features["range_low"] - buffer
             tp = price + rng * self.rr_multiple
         else:
-            sl = features["range_high"] + 5 * POINT
+            sl = features["range_high"] + buffer
             tp = price - rng * self.rr_multiple
         return sl, tp
 
@@ -790,7 +849,7 @@ class TradeEngine:
         self.max_concurrent = max(self.max_concurrent, len(self.open_positions))
         return trade
 
-    def check_exits(self, bar: Bar):
+    def check_exits(self, bar: Bar, strategies: dict = None):
         still_open = []
         for t in self.open_positions:
             closed = False
@@ -816,10 +875,12 @@ class TradeEngine:
                     reason = "TP"
                     closed = True
 
-            # Time exit
             if not closed:
                 hours_open = (bar.time - t.open_time).total_seconds() / 3600
-                if hours_open >= 4:  # generic max hold
+                max_hold = 4
+                if strategies and t.strategy in strategies:
+                    max_hold = strategies[t.strategy].max_hold_hours
+                if hours_open >= max_hold:
                     close_price = bar.close
                     reason = "TIME"
                     closed = True
@@ -964,16 +1025,19 @@ def compute_metrics(engine: TradeEngine, months: float) -> dict:
 # ---------------------------------------------------------------------------
 def run_backtest(months: int = 6, strategies: list = None,
                  lot_mode: str = "fixed", initial_balance: float = 10000.0,
-                 risk_pct: float = 0.01, max_concurrent: int = 0):
+                 risk_pct: float = 0.01, max_concurrent: int = 0,
+                 start_date: str = None, end_date: str = None):
 
     log.info("=" * 60)
     log.info("MATLAMA QUANT ECOSYSTEM — PORTFOLIO BACKTEST")
+    if start_date and end_date:
+        log.info(f"Date range: {start_date} to {end_date}")
     log.info("=" * 60)
 
     # Load data
-    df = load_real_data(months)
+    df = load_real_data(months, start_date, end_date)
     if df is None:
-        df = generate_synthetic_gold(months)
+        df = generate_synthetic_gold(months, start_date, end_date)
 
     # Compute indicators
     log.info("Computing indicators...")
@@ -1048,12 +1112,12 @@ def run_backtest(months: int = 6, strategies: list = None,
 
         # Daily loss check
         if (daily_start_balance - engine.equity) >= 50:
-            engine.check_exits(bar)
+            engine.check_exits(bar, active)
             engine.update_equity(bar.close, bar_time)
             continue
 
         # Check exits on existing positions
-        engine.check_exits(bar)
+        engine.check_exits(bar, active)
 
         # Get current indicator values
         atr = ind["atr"].iloc[i]
@@ -1126,7 +1190,13 @@ def run_backtest(months: int = 6, strategies: list = None,
             t.strategy, t.regime, t.profit > 0, t.profit
         )
 
-    metrics = compute_metrics(engine, months)
+    if start_date and end_date:
+        d0 = datetime.strptime(start_date, "%Y-%m-%d")
+        d1 = datetime.strptime(end_date, "%Y-%m-%d")
+        period_months = (d1 - d0).days / 30.0
+    else:
+        period_months = months
+    metrics = compute_metrics(engine, period_months)
     return engine, metrics
 
 
@@ -1305,6 +1375,10 @@ def run_comparison(months: int = 6, strategies: list = None):
 def main():
     parser = argparse.ArgumentParser(description="Matlama Backtest Engine")
     parser.add_argument("--months", type=int, default=6, help="Backtest period")
+    parser.add_argument("--start-date", type=str, default=None,
+                        help="Start date YYYY-MM-DD (overrides --months)")
+    parser.add_argument("--end-date", type=str, default=None,
+                        help="End date YYYY-MM-DD (overrides --months)")
     parser.add_argument("--strategies", type=str, default=None,
                         help="Comma-separated strategy tags (default: all)")
     parser.add_argument("--lot-mode", choices=["fixed", "dynamic"],
@@ -1331,6 +1405,8 @@ def main():
             initial_balance=args.balance,
             risk_pct=args.risk_pct,
             max_concurrent=args.max_positions,
+            start_date=args.start_date,
+            end_date=args.end_date,
         )
         report = save_results(engine, metrics)
         print(report)
