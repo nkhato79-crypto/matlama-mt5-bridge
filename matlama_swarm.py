@@ -49,11 +49,7 @@ MT5_FILES = (
 )
 
 TRADE_CSVS = {
-    "MBV3": os.path.join(MT5_FILES, "bridgev3_trades.csv"),
-    "QUANT": os.path.join(MT5_FILES, "quant_trades.csv"),
-    "HFT": os.path.join(MT5_FILES, "hft_trades.csv"),
-    "SCALPER": os.path.join(MT5_FILES, "scalper_trades.csv"),
-    "TICK_SCALPER": os.path.join(MT5_FILES, "tick_scalper_trades.csv"),
+    "ORB": os.path.join(MT5_FILES, "orb_trades.csv"),
 }
 
 MODEL_FILES = {

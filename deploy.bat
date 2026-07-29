@@ -1,7 +1,8 @@
 @echo off
 REM ================================================================
-REM  Matlama Deploy Script — Run on VPS as Administrator
-REM  Pulls latest code, copies EA files to MT5, restarts services.
+REM  Matlama Deploy Script — ORB-Only Mode
+REM  Pulls latest code, copies MatlamaORB + support files to MT5,
+REM  restarts Swarm. All other strategies are cut.
 REM ================================================================
 
 setlocal enabledelayedexpansion
@@ -16,7 +17,7 @@ set METAEDITOR="%MT5_TERMINAL%\metaeditor64.exe"
 
 echo.
 echo ========================================
-echo   Matlama Deployment Script
+echo   Matlama Deploy — ORB-Only Mode
 echo   %date% %time%
 echo ========================================
 echo.
@@ -35,20 +36,15 @@ if errorlevel 1 (
 echo      Done.
 echo.
 
-REM --- Step 2: Copy MQ5 files to MT5 ---
-echo [2/5] Copying EA files to MetaTrader...
+REM --- Step 2: Copy ORB + support files to MT5 ---
+echo [2/5] Copying ORB files to MetaTrader...
 if not exist "%MT5_EXPERTS%" mkdir "%MT5_EXPERTS%"
 
 for %%f in (
-    MatlamaQuant.mq5
-    MatlamaScalper.mq5
-    MatlamaTickScalper.mq5
-    MatlamaBridgeHFT.mq5
-    matlamabridgeV3.mq5
     MatlamaORB.mq5
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
-    OrchestratorClient.mqh
+    DynamicLot.mqh
     PropFirmGuard.mqh
 ) do (
     if exist "%REPO_DIR%\%%f" (
@@ -56,19 +52,15 @@ for %%f in (
         echo      Copied %%f
     )
 )
-
-REM DynamicLot.mqh goes to Include folder so all EAs can find it
-copy /y "%REPO_DIR%\DynamicLot.mqh" "%MT5_EXPERTS%\DynamicLot.mqh" >nul
-echo      Copied DynamicLot.mqh
 echo      Done.
 echo.
 
-REM --- Step 3: Compile EAs ---
-echo [3/5] Compiling EAs in MetaEditor...
+REM --- Step 3: Compile ORB EA ---
+echo [3/5] Compiling MatlamaORB...
 
 if not exist %METAEDITOR% (
     echo      WARNING: MetaEditor not found at %METAEDITOR%
-    echo      You will need to compile manually in MetaEditor -- press F7 on each EA.
+    echo      Compile manually in MetaEditor -- press F7 on MatlamaORB.
     echo      Skipping compilation...
     goto skip_compile
 )
@@ -76,11 +68,6 @@ if not exist %METAEDITOR% (
 if not exist "%REPO_DIR%\logs" mkdir "%REPO_DIR%\logs"
 
 for %%f in (
-    MatlamaQuant.mq5
-    MatlamaScalper.mq5
-    MatlamaTickScalper.mq5
-    MatlamaBridgeHFT.mq5
-    matlamabridgeV3.mq5
     MatlamaORB.mq5
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
@@ -112,19 +99,13 @@ echo.
 REM --- Step 4: Restart Python services ---
 echo [4/5] Restarting Python services...
 
-REM Kill existing processes gracefully
-tasklist /fi "windowtitle eq Orchestrator*" 2>nul | findstr python >nul
-for /f "tokens=2" %%p in ('tasklist /fi "imagename eq python.exe" /fo list 2^>nul ^| findstr PID') do (
-    REM We restart via swarm — it supervises the others now
-)
-
 REM Stop old swarm if running
 taskkill /f /fi "windowtitle eq MatlamaSwarm" >nul 2>&1
 
 REM Give processes time to exit
 timeout /t 3 /nobreak >nul
 
-REM Start swarm (it will auto-start orchestrator, threshold, bridge via supervisor)
+REM Start swarm
 echo      Starting Matlama Swarm Commander...
 start "MatlamaSwarm" /min python "%REPO_DIR%\matlama_swarm.py"
 echo      Done.
@@ -174,8 +155,15 @@ if %ALL_OK%==1 (
 )
 echo ========================================
 echo.
-echo  IMPORTANT: Restart MetaTrader 5 to load
-echo  the newly compiled EAs. Or remove and
-echo  re-attach each EA to its chart.
+echo  ORB-ONLY MODE: Only MatlamaORB should be
+echo  attached to charts. Remove all other EAs
+echo  from MT5 if still attached:
+echo    - MatlamaQuant
+echo    - MatlamaScalper
+echo    - MatlamaTickScalper
+echo    - MatlamaBridgeHFT
+echo    - matlamabridgeV3
+echo.
+echo  Then restart MT5 or re-attach MatlamaORB.
 echo.
 pause
