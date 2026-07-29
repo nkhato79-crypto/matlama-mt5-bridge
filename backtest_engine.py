@@ -372,7 +372,7 @@ class ScalperStrategy(BaseStrategy):
 class QuantStrategy(BaseStrategy):
     """Fibonacci pressure + velocity (MatlamaQuant, simplified)"""
     def __init__(self):
-        super().__init__("QUANT", max_trades_per_day=5, max_hold_hours=4)
+        super().__init__("QUANT", max_trades_per_day=6, max_hold_hours=4)
 
     def compute_features(self, idx, df, ind):
         close = df["close"].iloc[idx]
@@ -672,12 +672,12 @@ class OrchestratorSim:
     def detect_regime(self, atr, adx, volatility, news_risk=0):
         if news_risk == 1:
             return "NEWS"
-        if atr > 25 and adx > 25:
-            return "TREND"
-        if volatility < 0.4:
-            return "RANGE"
-        if atr > 40 and volatility > 0.8:
+        if atr > 15 and volatility > 0.25:
             return "CRISIS"
+        if atr > 5 and adx > 25:
+            return "TREND"
+        if adx < 20 and volatility < 0.10:
+            return "RANGE"
         return "MIXED"
 
     def win_rate(self, strategy=None, regime=None):

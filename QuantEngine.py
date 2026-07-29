@@ -36,7 +36,7 @@ MT5_FILES = (
 )
 TRADES_CSV = os.path.join(MT5_FILES, "quant_trades.csv")
 
-MIN_TRADES          = 50
+MIN_TRADES          = 20
 RETRAIN_INTERVAL_H  = 24
 
 # Quant-specific feature columns.

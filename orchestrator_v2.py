@@ -203,6 +203,18 @@ memory = TradeMemory(persist_path=MEMORY_FILE)
 # REGIME ENGINE (shared across all strategies)
 # =========================================================
 def detect_regime(f):
+    """
+    Classify market regime from M5 XAUUSD features.
+
+    Typical M5 gold values (from OrchestratorClient.mqh):
+      - atr: ATR(14) in pips — usually 2-15 on M5
+      - adx: ADX(14) raw value — 10-50 range
+      - volatility: stdev of pct returns * 100 over 20 M5 bars — usually 0.05-0.40
+
+    Thresholds recalibrated 2026-07-29 from demo data analysis.
+    Previous thresholds (atr>25, volatility<0.4) were set for H1 and caused
+    regime to be stuck on RANGE for nearly all M5 ticks.
+    """
     atr = f.get("atr", 0)
     adx = f.get("adx", 0)
     volatility = f.get("volatility", 0)
@@ -210,14 +222,14 @@ def detect_regime(f):
     if f.get("news_risk", 0) == 1:
         return "NEWS"
 
-    if atr > 25 and adx > 25:
+    if atr > 15 and volatility > 0.25:
+        return "CRISIS"
+
+    if atr > 5 and adx > 25:
         return "TREND"
 
-    if volatility < 0.4:
+    if adx < 20 and volatility < 0.10:
         return "RANGE"
-
-    if atr > 40 and volatility > 0.8:
-        return "CRISIS"
 
     return "MIXED"
 

@@ -22,6 +22,8 @@ input int      SL_Buffer       = 10;        // pips beyond Fib level for SL
 input int      PollSeconds     = 10;        // faster poll for reactive entries
 input double   MaxDailyLoss    = 100.0;
 input bool     AutoTrade       = true;
+input int      MaxTradesPerDay = 6;          // max entries per day (prevents overtrading)
+input int      CooldownSeconds = 300;        // 5-min cooldown between trades
 
 //--- Fibonacci Settings
 input int      SwingLookback   = 50;        // candles to look back for swing high/low
@@ -85,6 +87,7 @@ input int      FalseSweepMinFails         = 2;     // block if this many exhaust
 CTrade   trade;
 datetime LastCheck      = 0;
 datetime EntryTime      = 0;
+datetime LastTradeTime  = 0;          // cooldown tracking
 double   dailyStartBalance;
 datetime dailyResetTime;
 int      rsiHandle;
@@ -114,6 +117,34 @@ int      TickCount      = 0;
 
 //--- CSV logging
 string   CSV_PATH = "quant_trades.csv";
+
+//+------------------------------------------------------------------+
+//| Count today's entries for this EA (MaxTradesPerDay enforcement)   |
+//+------------------------------------------------------------------+
+int QuantCountTradesToday()
+{
+   int count = 0;
+   datetime now = TimeGMT();
+   datetime dayStart = now - (now % 86400);
+   if(!HistorySelect(dayStart, now)) return 0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber &&
+         HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         count++;
+   }
+   // Also count currently open positions (they had an entry today too)
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetTicket(i) > 0 &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         PositionGetInteger(POSITION_TIME) >= dayStart)
+         count++;
+   }
+   return count;
+}
 
 //+------------------------------------------------------------------+
 //| Calculate Fibonacci levels from swing high/low                   |
@@ -1155,6 +1186,18 @@ void OnTick()
 
    if(!AutoTrade) return;
 
+   // MaxTradesPerDay gate
+   if(QuantCountTradesToday() >= MaxTradesPerDay)
+   {
+      return;
+   }
+
+   // Cooldown between trades
+   if(LastTradeTime > 0 && (TimeCurrent() - LastTradeTime) < CooldownSeconds)
+   {
+      return;
+   }
+
    // Skip if already in a position
    for(int i = 0; i < PositionsTotal(); i++)
    {
@@ -1387,6 +1430,7 @@ void OnTick()
                " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
                " Lot:", DoubleToString(lot, 2), sourceTag);
          EntryTime = TimeCurrent();
+         LastTradeTime = TimeCurrent();
       }
       else Print("BUY failed: ", trade.ResultRetcodeDescription());
    }
@@ -1405,6 +1449,7 @@ void OnTick()
                " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
                " Lot:", DoubleToString(lot, 2), sourceTag);
          EntryTime = TimeCurrent();
+         LastTradeTime = TimeCurrent();
       }
       else Print("SELL failed: ", trade.ResultRetcodeDescription());
    }

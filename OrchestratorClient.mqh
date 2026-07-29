@@ -29,6 +29,11 @@ string OrchJsonGetString(string json, string key)
 {
    string pattern = "\"" + key + "\":\"";
    int pos = StringFind(json, pattern);
+   if(pos < 0)
+   {
+      pattern = "\"" + key + "\": \"";
+      pos = StringFind(json, pattern);
+   }
    if(pos < 0) return "";
    int start = pos + StringLen(pattern);
    int end   = StringFind(json, "\"", start);
@@ -42,6 +47,8 @@ double OrchJsonGetDouble(string json, string key)
    int pos = StringFind(json, pattern);
    if(pos < 0) return 0.0;
    int start = pos + StringLen(pattern);
+   // skip optional whitespace after colon
+   while(start < StringLen(json) && StringGetCharacter(json, start) == ' ') start++;
    int len   = StringLen(json);
    int end   = start;
    while(end < len)
