@@ -71,7 +71,7 @@ input double   SweepMinPips            = 5.0;    // min pips beyond swing level 
 input int      FVG_Lookback            = 30;     // M5 candles to scan for unfilled FVGs
 input double   FVG_MinGapPips          = 3.0;    // minimum FVG size in pips to be tradeable
 input double   SweepFVG_SL_BufferPips  = 8.0;    // SL buffer beyond the sweep level for override trades
-input bool     EnableContinuation      = true;   // allow sweep + fresh (unretested) FVG to fire a continuation entry
+input bool     EnableContinuation      = false;  // DISABLED — continuation contradicts reversal thesis (0% WR in demo)
 input int      ContinuationFVGMaxAge   = 5;      // max bars since FVG formed to still count as "fresh"
 input double   ContinuationSL_BufferPips = 5.0;  // SL buffer beyond the fresh FVG's near edge
 
@@ -82,6 +82,10 @@ input double   MaxEMAExtensionATR         = 2.0;   // max ATR units from slow EM
 input int      RSIDivergenceBars          = 5;     // M5 bars to check for momentum divergence
 input double   MinContinuationVolRatio    = 1.0;   // volume must be above average to confirm institutional flow
 input int      FalseSweepMinFails         = 2;     // block if this many exhaustion signals fire (out of 4)
+
+//--- Layer Confluence Override (fires when N of 5 layers agree, even without Sweep+FVG)
+input bool     EnableLayerOverride      = true;    // allow layer confluence to trigger trades
+input int      MinLayersToFire          = 3;       // minimum layers (of 5) needed to override ORCH HOLD
 
 //--- Entry Quality Filters (forensic-derived: reversal signals must fade momentum)
 input bool     EnableVelocityFilter     = true;    // block momentum-aligned entries (counter-momentum wins 86%)
@@ -1398,10 +1402,7 @@ void OnTick()
          Print("=== SWEEP+FVG RETEST OVERRIDE | ORCH said HOLD, taking ", direction,
                " on Layer 6+7 confluence ===");
       }
-      // OR-path #2: continuation — sweep confirmed, but instead of waiting
-      // for a pullback that may never come, a fresh unfilled FVG in the
-      // same direction confirms the impulse itself has conviction, so we
-      // ride the move rather than only ever catching mean-reversions.
+      // OR-path #2 (disabled by default): continuation
       else if(EnableContinuation && CheckSweepContinuation(direction, sweepLevel, gapTop, gapBottom, fvgBarsAgo))
       {
          if(IsFalseSweepContinuation(direction, sweepLevel))
@@ -1414,9 +1415,20 @@ void OnTick()
          Print("=== SWEEP+CONTINUATION OVERRIDE | ORCH said HOLD, taking ", direction,
                " on sweep + fresh FVG (no retest required) ===");
       }
+      // OR-path #3: layer confluence — 3+ of the 5 original layers agree
+      // on direction, which is itself strong structural confirmation.
+      else if(EnableLayerOverride && confirmedLayers >= MinLayersToFire)
+      {
+         direction    = dirGuess;
+         isOverride   = true;
+         overrideMode = "LAYERS";
+         Print("=== LAYER CONFLUENCE OVERRIDE | ORCH said HOLD, taking ", direction,
+               " on ", confirmedLayers, "/5 layers confirming ===");
+      }
       else
       {
-         Print("Signal: HOLD | Orchestrator declined, no Sweep+FVG override available (retest or continuation)");
+         Print("Signal: HOLD | Orchestrator declined, no override available (retest/layers: ",
+               confirmedLayers, "/5)");
          return;
       }
    }
@@ -1425,13 +1437,8 @@ void OnTick()
       direction = dec.decision; // "BUY" or "SELL" — orchestrator is authoritative
    }
 
-   if(isOverride && !CheckDynamicSpread(sweepLevel))
+   if(isOverride && overrideMode != "LAYERS" && !CheckDynamicSpread(sweepLevel))
    {
-      // Reuse the existing dynamic spread guard for override trades too —
-      // the orchestrator path already applies its own spread check server-side,
-      // but the override path bypasses the orchestrator entirely so it needs
-      // this safety net applied locally. Distance is measured against the
-      // swept level itself, since that's the structural reference for this signal.
       Print(overrideMode, " override skipped | Spread too wide relative to structure");
       return;
    }
@@ -1439,7 +1446,10 @@ void OnTick()
    double distance;
    nearestFib = GetNearestFibLevel(price, distance);
 
-   if(isOverride)
+   if(isOverride && overrideMode == "LAYERS")
+      Print("=== LAYERS SIGNAL | Direction: ", direction,
+            " | Layers: ", confirmedLayers, "/5 | Fib: ", DoubleToString(nearestFib, 2), " ===");
+   else if(isOverride)
       Print("=== ", overrideMode, " SIGNAL | Direction: ", direction,
             " | Sweep level: ", DoubleToString(sweepLevel, 2),
             " | FVG: ", DoubleToString(gapBottom, 2), "-", DoubleToString(gapTop, 2), " ===");
@@ -1485,8 +1495,9 @@ void OnTick()
       GetTradeLevels(direction, nearestFib, dec.regime, price, sl, tp1, tp2, tp3);
 
    string tradeComment = "";
-   if(overrideMode == "RETEST")       tradeComment = "_SWEEPFVG";
+   if(overrideMode == "RETEST")            tradeComment = "_SWEEPFVG";
    else if(overrideMode == "CONTINUATION") tradeComment = "_SWEEPCONT";
+   else if(overrideMode == "LAYERS")       tradeComment = "_LAYERS" + (string)confirmedLayers;
 
    string sourceTag = isOverride ? (" | Source: " + overrideMode + " OVERRIDE") : " | Source: ORCH";
    bool success = false;
