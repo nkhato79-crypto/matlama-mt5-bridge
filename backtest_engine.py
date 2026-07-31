@@ -444,7 +444,9 @@ class QuantStrategy(BaseStrategy):
 
     def compute_sl_tp(self, direction, price, atr, features):
         sl_dist = max(atr * 1.5, 10 * POINT)
-        tp_dist = max(atr * 3.0, 20 * POINT)
+        tp_raw = max(atr * 3.0, 20 * POINT)
+        tp_cap = atr * 1.5
+        tp_dist = min(tp_raw, tp_cap) if tp_cap > 0 else tp_raw
         if direction == "BUY":
             return price - sl_dist, price + tp_dist
         return price + sl_dist, price - tp_dist

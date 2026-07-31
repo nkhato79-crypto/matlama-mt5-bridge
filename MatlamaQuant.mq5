@@ -87,6 +87,9 @@ input int      FalseSweepMinFails         = 2;     // block if this many exhaust
 input bool     EnableVelocityFilter     = true;    // block momentum-aligned entries (counter-momentum wins 86%)
 input double   MinVolumeRatio           = 0.20;    // minimum volume ratio to confirm institutional participation
 
+//--- TP Cap (prevents TP from being unreachable on wide SL distances)
+input double   MaxTP_ATR               = 1.5;     // cap TP1 at this multiple of ATR(14) — 0 = no cap
+
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck      = 0;
@@ -571,6 +574,50 @@ bool CheckLiquiditySweepFVG(string &direction, double &sweepLevel,
 }
 
 //+------------------------------------------------------------------+
+//| Cap TP1 at MaxTP_ATR × current ATR to keep targets reachable.    |
+//| Gold's sweep/FVG structure can place SL far from entry, making   |
+//| R-multiple TPs unrealistic. ATR adapts to live volatility.       |
+//+------------------------------------------------------------------+
+double ClampTP(string direction, double currentPrice, double rawTP)
+{
+   if(MaxTP_ATR <= 0) return rawTP;
+
+   double atrCapBuf[];
+   ArraySetAsSeries(atrCapBuf, true);
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrCapBuf) < 1 || atrCapBuf[0] <= 0)
+      return rawTP;
+
+   double maxDist = MaxTP_ATR * atrCapBuf[0];
+
+   if(direction == "BUY")
+   {
+      double capped = currentPrice + maxDist;
+      if(rawTP > capped)
+      {
+         Print("TP CAP | BUY TP clamped from ", DoubleToString(rawTP, 2),
+               " to ", DoubleToString(capped, 2),
+               " (", DoubleToString(MaxTP_ATR, 1), " × ATR = ",
+               DoubleToString(maxDist / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10), 1), " pips)");
+         return capped;
+      }
+   }
+   else
+   {
+      double capped = currentPrice - maxDist;
+      if(rawTP < capped)
+      {
+         Print("TP CAP | SELL TP clamped from ", DoubleToString(rawTP, 2),
+               " to ", DoubleToString(capped, 2),
+               " (", DoubleToString(MaxTP_ATR, 1), " × ATR = ",
+               DoubleToString(maxDist / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10), 1), " pips)");
+         return capped;
+      }
+   }
+
+   return rawTP;
+}
+
+//+------------------------------------------------------------------+
 //| Trade levels for a Sweep+FVG override entry.                     |
 //| SL anchors to the swept liquidity level (the level that must NOT |
 //| be re-broken for the trade thesis to remain valid), not the      |
@@ -587,15 +634,15 @@ void GetSweepFVGTradeLevels(string direction, double sweepLevel,
    {
       sl  = sweepLevel - buffer;
       double risk = currentPrice - sl;
-      tp1 = currentPrice + 2.0 * risk;   // conservative 2R lock-in
-      tp2 = Fib236;                      // reuse existing Fib map for scale-out targets
+      tp1 = ClampTP(direction, currentPrice, currentPrice + 2.0 * risk);
+      tp2 = Fib236;
       tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
    }
    else
    {
       sl  = sweepLevel + buffer;
       double risk = sl - currentPrice;
-      tp1 = currentPrice - 2.0 * risk;
+      tp1 = ClampTP(direction, currentPrice, currentPrice - 2.0 * risk);
       tp2 = Ext127;
       tp3 = Ext162;
    }
@@ -713,9 +760,9 @@ void GetContinuationTradeLevels(string direction, double gapTop, double gapBotto
 
    if(direction == "BUY")
    {
-      sl  = gapBottom - buffer;   // near edge of the fresh gap
+      sl  = gapBottom - buffer;
       double risk = currentPrice - sl;
-      tp1 = currentPrice + 1.5 * risk;   // tighter target — chasing, not at a discount
+      tp1 = ClampTP(direction, currentPrice, currentPrice + 1.5 * risk);
       tp2 = SwingHigh;
       tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
    }
@@ -723,7 +770,7 @@ void GetContinuationTradeLevels(string direction, double gapTop, double gapBotto
    {
       sl  = gapTop + buffer;
       double risk = sl - currentPrice;
-      tp1 = currentPrice - 1.5 * risk;
+      tp1 = ClampTP(direction, currentPrice, currentPrice - 1.5 * risk);
       tp2 = SwingLow;
       tp3 = SwingLow - (SwingHigh - SwingLow) * 0.272;
    }
@@ -884,25 +931,25 @@ void GetTradeLevels(string direction, double nearestFib, string regime, double c
 
    if(direction == "BUY")
    {
-      sl  = nearestFib - buffer;         // SL below the Fib level we broke
+      sl  = nearestFib - buffer;
       double risk = currentPrice - sl;
       if(regime == "RANGE")
-         tp1 = currentPrice + 2.0 * risk;  // tight lock-in
+         tp1 = ClampTP(direction, currentPrice, currentPrice + 2.0 * risk);
       else
-         tp1 = Fib382;                     // next Fib up (TREND / other regimes)
-      tp2 = Fib236;                      // next Fib after that
-      tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272; // 127.2% extension
+         tp1 = ClampTP(direction, currentPrice, Fib382);
+      tp2 = Fib236;
+      tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
    }
    else
    {
-      sl  = nearestFib + buffer;         // SL above the Fib level we broke
+      sl  = nearestFib + buffer;
       double risk = sl - currentPrice;
       if(regime == "RANGE")
-         tp1 = currentPrice - 2.0 * risk;  // tight lock-in
+         tp1 = ClampTP(direction, currentPrice, currentPrice - 2.0 * risk);
       else
-         tp1 = Fib786;                     // next Fib down (TREND / other regimes)
-      tp2 = Ext127;                      // 127.2% extension
-      tp3 = Ext162;                      // 161.8% extension
+         tp1 = ClampTP(direction, currentPrice, Fib786);
+      tp2 = Ext127;
+      tp3 = Ext162;
    }
 }
 
