@@ -36,7 +36,7 @@ MT5_FILES = (
 )
 TRADES_CSV = os.path.join(MT5_FILES, "quant_trades.csv")
 
-MIN_TRADES          = 50
+MIN_TRADES          = 20
 RETRAIN_INTERVAL_H  = 24
 
 # Quant-specific feature columns.
@@ -71,10 +71,10 @@ def load_trades():
         return None
 
     try:
-        df = pd.read_csv(TRADES_CSV, sep=r'\s+', engine='python')
+        df = pd.read_csv(TRADES_CSV)
     except Exception:
         try:
-            df = pd.read_csv(TRADES_CSV)
+            df = pd.read_csv(TRADES_CSV, sep=r'\s+', engine='python')
         except Exception as e:
             logger.error("Failed to read CSV: %s", e)
             return None

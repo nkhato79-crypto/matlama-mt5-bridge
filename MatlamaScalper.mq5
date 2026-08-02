@@ -9,10 +9,13 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaScalper v1";
 input double   LotSize        = 0.01;
+input double   RiskPercent    = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      SL_Pips        = 15;
 input int      TP_Pips        = 20;
 input int      Slippage       = 10;
@@ -52,10 +55,10 @@ string   CSV_PATH  = "scalper_trades.csv";
 
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -79,7 +82,20 @@ void LogClosedTrades()
    int total = HistoryDealsTotal();
    if(total == 0) return;
 
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   bool hasNew = false;
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket <= lastLoggedTicket) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((ulong)HistoryDealGetInteger(ticket, DEAL_MAGIC) != (ulong)MagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      hasNew = true;
+      break;
+   }
+   if(!hasNew) return;
+
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE) return;
    FileSeek(handle, 0, SEEK_END);
 
@@ -183,12 +199,15 @@ int OnInit()
 
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",    _Symbol);
    Print("Timeframe: M5");
    Print("AutoTrade: ", AutoTrade ? "ENABLED" : "DISABLED");
    Print("EMA: ",       EMA_Fast, "/", EMA_Slow);
    Print("RSI: ",       RSI_Period, " OB:", RSI_OB, " OS:", RSI_OS);
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -219,6 +238,8 @@ void OnTick()
       dailyResetTime    = TimeCurrent();
       Print("Daily balance reset: ", dailyStartBalance);
    }
+
+   PropGuardOnTick();
 
    // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -318,6 +339,12 @@ void OnTick()
 
    if(!AutoTrade || signal == "HOLD") return;
 
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED scalper trade | ", PropGuardStatus());
+      return;
+   }
+
    // Execute trade
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double pipSize = point * 10;
@@ -330,9 +357,13 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "SCALP_BUY");
+      double lot = CalcDynamicLot(_Symbol, (double)SL_Pips, PropGuardClampRisk(RiskPercent), LotSize);
+      success    = trade.Buy(lot, _Symbol, 0, sl, tp, "SCALP_BUY");
       if(success)
-         Print("SCALP BUY | Ask:", ask, " SL:", sl, " TP:", tp);
+      {
+         PropGuardOnTrade();
+         Print("SCALP BUY | Ask:", ask, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
+      }
       else
          Print("SCALP BUY failed: ", trade.ResultRetcodeDescription());
    }
@@ -341,9 +372,13 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "SCALP_SELL");
+      double lot = CalcDynamicLot(_Symbol, (double)SL_Pips, PropGuardClampRisk(RiskPercent), LotSize);
+      success    = trade.Sell(lot, _Symbol, 0, sl, tp, "SCALP_SELL");
       if(success)
-         Print("SCALP SELL | Bid:", bid, " SL:", sl, " TP:", tp);
+      {
+         PropGuardOnTrade();
+         Print("SCALP SELL | Bid:", bid, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
+      }
       else
          Print("SCALP SELL failed: ", trade.ResultRetcodeDescription());
    }

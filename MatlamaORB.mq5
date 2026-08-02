@@ -13,6 +13,8 @@
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 CTrade trade;
 
 //--- Identity
@@ -29,13 +31,22 @@ input int    BreakoutValidMins = 180;        // How long after range closes a br
 
 //--- Risk settings
 input double LotSize           = 0.01;
+input double RiskPercent       = 1.0;        // % of equity risked per trade (0 = use fixed LotSize)
 input double SLBufferPips      = 5.0;        // Extra buffer beyond range boundary for SL
 input double RR_Multiple       = 2.0;        // TP = range size * this multiple
 input int    MaxTradesPerDay   = 4;          // Across both sessions combined (2 sessions x long/short)
+input double MinRangeSizePips = 3.0;        // Minimum range size to trade (filters noise breakouts)
+input int    EarliestTradeHour = 7;         // Block entries before this hour (UTC)
+input int    LatestTradeHour   = 20;        // Block entries at or after this hour (UTC)
 
 //--- CSV logging
 string   CSV_PATH = "orb_trades.csv";
 ulong    lastLoggedTicket = 0;
+
+//--- Per-trade range snapshot (stored at entry via Global Variables so the
+//    closing logger can read the range that was active when the trade opened,
+//    not today's range which may be different or zeroed).
+//    Key format: "ORB_EntryRH_{ticket}" / "ORB_EntryRL_{ticket}" / "ORB_EntryOP_{ticket}"
 
 //--- Per-session state, index 0 = London, index 1 = NY
 datetime rangeDayStamp[2];
@@ -83,10 +94,13 @@ int OnInit()
       }
    }
 
+   PropGuardInit();
+
    Print(EA_Name, " initialized | Magic:", MagicORB,
          " | London ", LondonStartHour, ":", LondonStartMin,
          " | NY ", NYStartHour, ":", NYStartMin,
          " | Window:", RangeWindowMins, "min");
+   Print(PropGuardStatus());
    return(INIT_SUCCEEDED);
 }
 
@@ -176,17 +190,41 @@ void CheckBreakoutEntries(int s)
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
+   MqlDateTime nowDt;
+   TimeToStruct(TimeGMT(), nowDt);
+   if(nowDt.hour < EarliestTradeHour || nowDt.hour >= LatestTradeHour) return;
+
+   double rangeSizePips = rangeSize / (point * 10);
+   if(rangeSizePips < MinRangeSizePips)
+   {
+      Print(EA_Name, " | ", sessionLabel[s], " range too narrow: ",
+            DoubleToString(rangeSizePips, 1), " pips (min ", MinRangeSizePips, ")");
+      return;
+   }
+
    if(CountTradesToday() >= MaxTradesPerDay) return;
+   if(!PropGuardCanTrade()) return;
 
    if(!longTaken[s] && ask > rangeHigh[s])
    {
       double sl = rangeLow[s] - buffer;
       double tp = ask + (rangeSize * RR_Multiple);
+      double sl_pips_long = (ask - sl) / (point * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips_long, PropGuardClampRisk(RiskPercent), LotSize);
       trade.SetExpertMagicNumber(MagicORB);
-      if(trade.Buy(LotSize, _Symbol, ask, sl, tp, EA_Name + " " + sessionLabel[s] + " long"))
+      if(trade.Buy(lot, _Symbol, ask, sl, tp, EA_Name + " " + sessionLabel[s] + " long"))
       {
+         PropGuardOnTrade();
          longTaken[s] = true;
-         Print(EA_Name, " | ", sessionLabel[s], " LONG breakout @", ask, " SL:", sl, " TP:", tp);
+         ulong posTicket = trade.ResultOrder();
+         if(posTicket > 0)
+         {
+            GlobalVariableSet("ORB_EntryRH_" + (string)posTicket, rangeHigh[s]);
+            GlobalVariableSet("ORB_EntryRL_" + (string)posTicket, rangeLow[s]);
+            GlobalVariableSet("ORB_EntryOP_" + (string)posTicket, ask);
+         }
+         Print(EA_Name, " | ", sessionLabel[s], " LONG breakout @", ask,
+               " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       }
    }
 
@@ -194,11 +232,22 @@ void CheckBreakoutEntries(int s)
    {
       double sl = rangeHigh[s] + buffer;
       double tp = bid - (rangeSize * RR_Multiple);
+      double sl_pips_short = (sl - bid) / (point * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips_short, PropGuardClampRisk(RiskPercent), LotSize);
       trade.SetExpertMagicNumber(MagicORB);
-      if(trade.Sell(LotSize, _Symbol, bid, sl, tp, EA_Name + " " + sessionLabel[s] + " short"))
+      if(trade.Sell(lot, _Symbol, bid, sl, tp, EA_Name + " " + sessionLabel[s] + " short"))
       {
+         PropGuardOnTrade();
          shortTaken[s] = true;
-         Print(EA_Name, " | ", sessionLabel[s], " SHORT breakdown @", bid, " SL:", sl, " TP:", tp);
+         ulong posTicket = trade.ResultOrder();
+         if(posTicket > 0)
+         {
+            GlobalVariableSet("ORB_EntryRH_" + (string)posTicket, rangeHigh[s]);
+            GlobalVariableSet("ORB_EntryRL_" + (string)posTicket, rangeLow[s]);
+            GlobalVariableSet("ORB_EntryOP_" + (string)posTicket, bid);
+         }
+         Print(EA_Name, " | ", sessionLabel[s], " SHORT breakdown @", bid,
+               " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       }
    }
 }
@@ -258,6 +307,42 @@ void LogClosedTrades()
       string session = (StringFind(comment, "NY") >= 0) ? "NY" : "LONDON";
       double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
 
+      // Recover open price by scanning history for the matching DEAL_ENTRY_IN
+      double openPrice = 0;
+      ulong positionId = (ulong)HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      for(int j = 0; j < total; j++)
+      {
+         ulong entryTicket = HistoryDealGetTicket(j);
+         if(HistoryDealGetInteger(entryTicket, DEAL_POSITION_ID) == (long)positionId &&
+            HistoryDealGetInteger(entryTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         {
+            openPrice = HistoryDealGetDouble(entryTicket, DEAL_PRICE);
+            break;
+         }
+      }
+
+      // Recover range from per-trade Global Variables saved at entry time;
+      // fall back to current session range only if the GVs were not found
+      // (e.g. trade opened before this fix was deployed).
+      string posKey = (string)positionId;
+      double logRangeHigh = 0, logRangeLow = 0;
+      if(GlobalVariableCheck("ORB_EntryRH_" + posKey))
+      {
+         logRangeHigh = GlobalVariableGet("ORB_EntryRH_" + posKey);
+         logRangeLow  = GlobalVariableGet("ORB_EntryRL_" + posKey);
+         if(openPrice == 0 && GlobalVariableCheck("ORB_EntryOP_" + posKey))
+            openPrice = GlobalVariableGet("ORB_EntryOP_" + posKey);
+         GlobalVariableDel("ORB_EntryRH_" + posKey);
+         GlobalVariableDel("ORB_EntryRL_" + posKey);
+         GlobalVariableDel("ORB_EntryOP_" + posKey);
+      }
+      else
+      {
+         int s = (session == "NY") ? 1 : 0;
+         logRangeHigh = rangeHigh[s];
+         logRangeLow  = rangeLow[s];
+      }
+
       int handle = FileOpen(CSV_PATH, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
       if(handle != INVALID_HANDLE)
       {
@@ -266,11 +351,11 @@ void LogClosedTrades()
                    (HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_SELL ? "BUY" : "SELL"),
                    TimeToString(HistoryDealGetInteger(ticket, DEAL_TIME)),
                    TimeToString(TimeCurrent()),
-                   0, HistoryDealGetDouble(ticket, DEAL_PRICE),
+                   openPrice, HistoryDealGetDouble(ticket, DEAL_PRICE),
                    HistoryDealGetDouble(ticket, DEAL_VOLUME),
                    profit,
-                   (session == "NY" ? rangeHigh[1] : rangeHigh[0]),
-                   (session == "NY" ? rangeLow[1]  : rangeLow[0]));
+                   logRangeHigh,
+                   logRangeLow);
          FileClose(handle);
       }
       lastLoggedTicket = ticket;
@@ -281,6 +366,8 @@ void LogClosedTrades()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   PropGuardOnTick();
+
    ResetDailyStateIfNeeded(0, LondonStartHour, LondonStartMin);
    ResetDailyStateIfNeeded(1, NYStartHour, NYStartMin);
 

@@ -12,15 +12,24 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-API_KEY        = os.getenv("API_KEY", "Yu4minawena!")
+API_KEY        = os.getenv("API_KEY", "")
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "XAUUSD")
 LOT_SIZE       = float(os.getenv("LOT_SIZE", 0.01))
 COT_BIAS       = os.getenv("COT_BIAS", "NEUTRAL").upper()
 DEALER_GAMMA   = float(os.getenv("DEALER_GAMMA", 0))
 
+_rates_cache = {}
+CACHE_TTL_SECONDS = 300
+
 # ── Data fetch ─────────────────────────────────────────────────────────────
 
 def get_rates(period="5d", interval="1h"):
+    import time
+    cache_key = f"{period}_{interval}"
+    cached = _rates_cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < CACHE_TTL_SECONDS:
+        return cached["df"]
+
     try:
         import yfinance as yf
         import pandas as pd
@@ -29,13 +38,14 @@ def get_rates(period="5d", interval="1h"):
         if df is None or df.empty:
             log.warning("Empty dataframe from yfinance")
             return None
-        # ticker.history() returns simple string columns
         df.columns = [str(c).lower() for c in df.columns]
         required = {"open", "high", "low", "close"}
         if not required.issubset(set(df.columns)):
             log.error(f"Missing columns: {df.columns.tolist()}")
             return None
-        return df.dropna()
+        result = df.dropna()
+        _rates_cache[cache_key] = {"df": result, "ts": time.time()}
+        return result
     except Exception as e:
         log.error(f"get_rates error: {e}")
         return None

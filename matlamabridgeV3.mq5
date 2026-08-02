@@ -9,10 +9,13 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name        = "MatlamaBridge v5";
 input double   LotSize        = 0.01;
+input double   RiskPercent    = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      SL_Pips        = 50;
 input int      TP_Pips        = 100;
 input int      Slippage       = 10;
@@ -56,6 +59,7 @@ input double   MaxAccountDrawdownPct  = 0.20;
 CTrade   trade;
 datetime LastCheck        = 0;
 string   LastSignal       = "";
+datetime LastSignalBar    = 0;
 double   dailyStartBalance;
 datetime dailyResetTime;
 int      atrHandle;
@@ -65,6 +69,8 @@ int      adxHandle;
 int      emaFastHandle;
 int      emaSlowHandle;
 string   LastRegime = "UNKNOWN";
+int      entryBuyScore   = 0;
+int      entrySellScore  = 0;
 
 //--- CSV logging
 string   CSV_PATH = "bridgev3_trades.csv"; // renamed from hft_trades.csv — was colliding with MatlamaBridgeHFT.mq5, which writes to the same filename with incompatible column meaning
@@ -75,10 +81,10 @@ ulong    lastLoggedTicket = 0;
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -118,7 +124,7 @@ void LogClosedTrades()
 
    // Open in append mode — READ|WRITE then seek to end
    int handle = FileOpen(CSV_PATH,
-                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
       Print("CSV ERROR: Cannot open for append. Error:", GetLastError());
@@ -161,8 +167,8 @@ void LogClosedTrades()
       }
 
       int durationMin = (int)((closeTime - entryTime) / 60);
-      int bScore = EvaluateSignal("BUY");
-      int sScore = EvaluateSignal("SELL");
+      int bScore = entryBuyScore;
+      int sScore = entrySellScore;
 
       FileWrite(handle,
          (string)ticket,
@@ -219,12 +225,15 @@ int OnInit()
 
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",     _Symbol);
    Print("AutoTrade: ",  AutoTrade ? "ENABLED" : "DISABLED");
    Print("COT Bias: ",   COT_Bias);
    Print("Threshold: ",  ScoreThreshold, "/9");
    Print("CSV Logging: ENABLED → ", CSV_PATH);
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -254,6 +263,8 @@ void OnTick()
       Print("Daily balance reset: ", dailyStartBalance);
    }
 
+   PropGuardOnTick();
+
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
    {
@@ -265,6 +276,13 @@ void OnTick()
 
    if((TimeCurrent() - LastCheck) < PollSeconds) return;
    LastCheck = TimeCurrent();
+
+   datetime currentBar = iTime(_Symbol, PERIOD_H1, 0);
+   if(currentBar != LastSignalBar)
+   {
+      LastSignal = "";
+      LastSignalBar = currentBar;
+   }
 
    // === ORCHESTRATOR v2 — FULL OVERRIDE ===
    // The 9-layer scoring model (EvaluateSignal) is bypassed; the orchestrator's
@@ -344,7 +362,8 @@ void OnTick()
    for(int i = 0; i < PositionsTotal(); i++)
    {
       if(PositionGetTicket(i) > 0 &&
-         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol)
       {
          Print("Position already open. Skipping.");
          return;
@@ -354,7 +373,14 @@ void OnTick()
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double pipSize = point * 10;
    double sl_dist = SL_Pips * pipSize;
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED trade | ", PropGuardStatus());
+      return;
+   }
+
    double tp_dist = TP_Pips * pipSize;
+   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, PropGuardClampRisk(RiskPercent), LotSize);
    bool   success = false;
 
    if(action == "BUY")
@@ -362,8 +388,8 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "MB_BUY");
-      if(success) Print("BUY executed | Ask:", ask, " SL:", sl, " TP:", tp);
+      success    = trade.Buy(lot, _Symbol, 0, sl, tp, "MB_BUY");
+      if(success) Print("BUY executed | Ask:", ask, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       else        Print("BUY failed: ", trade.ResultRetcodeDescription());
    }
    else if(action == "SELL")
@@ -371,12 +397,18 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "MB_SELL");
-      if(success) Print("SELL executed | Bid:", bid, " SL:", sl, " TP:", tp);
+      success    = trade.Sell(lot, _Symbol, 0, sl, tp, "MB_SELL");
+      if(success) Print("SELL executed | Bid:", bid, " SL:", sl, " TP:", tp, " Lot:", DoubleToString(lot, 2));
       else        Print("SELL failed: ", trade.ResultRetcodeDescription());
    }
 
-   if(success) LastSignal = action;
+   if(success)
+   {
+      PropGuardOnTrade();
+      LastSignal = action;
+      entryBuyScore  = EvaluateSignal("BUY");
+      entrySellScore = EvaluateSignal("SELL");
+   }
 }
 
 //+------------------------------------------------------------------+

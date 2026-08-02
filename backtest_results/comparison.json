@@ -1,0 +1,179 @@
+{
+  "Fixed 0.01 Lots": {
+    "total_trades": 705,
+    "total_pnl": 84.39,
+    "win_rate": 33.0,
+    "profit_factor": 1.01,
+    "sharpe_ratio": 0.22,
+    "sortino_ratio": 0.64,
+    "max_drawdown_pct": 15.77,
+    "calmar_ratio": 0.11,
+    "avg_win": 71.47,
+    "avg_loss": 35.1,
+    "win_loss_ratio": 2.04,
+    "max_concurrent_positions": 4,
+    "annual_return_pct": 1.69,
+    "initial_balance": 10000.0,
+    "final_balance": 10084.39,
+    "strategy_breakdown": {
+      "HFT": {
+        "trades": 228,
+        "win_rate": 2.1929824561403506,
+        "total_pnl": -707.4000000008664,
+        "avg_trade": -3.1026315789511685,
+        "best_trade": 5.69999999999709,
+        "worst_trade": -3.30000000000382
+      },
+      "SCALPER": {
+        "trades": 34,
+        "win_rate": 2.941176470588235,
+        "total_pnl": -57.70000000009986,
+        "avg_trade": -1.697058823532349,
+        "best_trade": 1.6999999999961801,
+        "worst_trade": -1.8000000000029104
+      },
+      "TICK_SCALPER": {
+        "trades": 42,
+        "win_rate": 4.761904761904762,
+        "total_pnl": -69.6000000001186,
+        "avg_trade": -1.657142857145681,
+        "best_trade": 1.1999999999989086,
+        "worst_trade": -1.8000000000029104
+      },
+      "ORB": {
+        "trades": 267,
+        "win_rate": 63.29588014981273,
+        "total_pnl": 1129.9999999992133,
+        "avg_trade": 4.2322097378247685,
+        "best_trade": 236.10000000000127,
+        "worst_trade": -298.8000000000011
+      },
+      "QUANT": {
+        "trades": 134,
+        "win_rate": 41.7910447761194,
+        "total_pnl": -210.9142857145389,
+        "avg_trade": -1.573987206824917,
+        "best_trade": 313.2214285714281,
+        "worst_trade": -186.07500000000073
+      }
+    }
+  },
+  "Dynamic 1% Risk": {
+    "total_trades": 681,
+    "total_pnl": 1139.46,
+    "win_rate": 33.3,
+    "profit_factor": 1.05,
+    "sharpe_ratio": 0.75,
+    "sortino_ratio": 1.84,
+    "max_drawdown_pct": 21.46,
+    "calmar_ratio": 1.06,
+    "avg_win": 106.72,
+    "avg_loss": 50.85,
+    "win_loss_ratio": 2.1,
+    "max_concurrent_positions": 4,
+    "annual_return_pct": 22.79,
+    "initial_balance": 10000.0,
+    "final_balance": 11139.46,
+    "strategy_breakdown": {
+      "HFT": {
+        "trades": 219,
+        "win_rate": 2.28310502283105,
+        "total_pnl": -1074.9000000013393,
+        "avg_trade": -4.9082191780883075,
+        "best_trade": 17.09999999999127,
+        "worst_trade": -9.90000000001146
+      },
+      "SCALPER": {
+        "trades": 33,
+        "win_rate": 3.0303030303030303,
+        "total_pnl": -81.1000000001377,
+        "avg_trade": -2.45757575757993,
+        "best_trade": 1.6999999999961801,
+        "worst_trade": -5.400000000008731
+      },
+      "TICK_SCALPER": {
+        "trades": 41,
+        "win_rate": 4.878048780487805,
+        "total_pnl": -95.40000000016335,
+        "avg_trade": -2.326829268296667,
+        "best_trade": 2.399999999997817,
+        "worst_trade": -3.6000000000058208
+      },
+      "ORB": {
+        "trades": 263,
+        "win_rate": 63.87832699619772,
+        "total_pnl": 1826.5999999989344,
+        "avg_trade": 6.945247148284921,
+        "best_trade": 472.20000000000255,
+        "worst_trade": -597.6000000000022
+      },
+      "QUANT": {
+        "trades": 125,
+        "win_rate": 40.8,
+        "total_pnl": 564.2642857139208,
+        "avg_trade": 4.514114285711367,
+        "best_trade": 483.51428571428187,
+        "worst_trade": -257.80714285714566
+      }
+    }
+  },
+  "Dynamic + 3-Pos Limit": {
+    "total_trades": 667,
+    "total_pnl": 703.17,
+    "win_rate": 33.4,
+    "profit_factor": 1.03,
+    "sharpe_ratio": 0.56,
+    "sortino_ratio": 1.57,
+    "max_drawdown_pct": 21.34,
+    "calmar_ratio": 0.66,
+    "avg_win": 102.18,
+    "avg_loss": 49.73,
+    "win_loss_ratio": 2.05,
+    "max_concurrent_positions": 3,
+    "annual_return_pct": 14.06,
+    "initial_balance": 10000.0,
+    "final_balance": 10703.17,
+    "strategy_breakdown": {
+      "HFT": {
+        "trades": 210,
+        "win_rate": 2.380952380952381,
+        "total_pnl": -1002.3000000012553,
+        "avg_trade": -4.772857142863121,
+        "best_trade": 17.09999999999127,
+        "worst_trade": -9.90000000001146
+      },
+      "SCALPER": {
+        "trades": 34,
+        "win_rate": 2.941176470588235,
+        "total_pnl": -84.70000000014352,
+        "avg_trade": -2.4911764705924564,
+        "best_trade": 1.6999999999961801,
+        "worst_trade": -5.400000000008731
+      },
+      "TICK_SCALPER": {
+        "trades": 39,
+        "win_rate": 5.128205128205128,
+        "total_pnl": -86.4000000001488,
+        "avg_trade": -2.2153846153884307,
+        "best_trade": 2.399999999997817,
+        "worst_trade": -3.6000000000058208
+      },
+      "ORB": {
+        "trades": 261,
+        "win_rate": 62.83524904214559,
+        "total_pnl": 1457.1999999989566,
+        "avg_trade": 5.5831417624481094,
+        "best_trade": 472.20000000000255,
+        "worst_trade": -597.6000000000022
+      },
+      "QUANT": {
+        "trades": 123,
+        "win_rate": 41.46341463414634,
+        "total_pnl": 419.37142857107574,
+        "avg_trade": 3.409523809520941,
+        "best_trade": 483.51428571428187,
+        "worst_trade": -257.80714285714566
+      }
+    }
+  }
+}

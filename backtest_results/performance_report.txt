@@ -1,0 +1,42 @@
+============================================================
+MATLAMA QUANT ECOSYSTEM — BACKTEST RESULTS
+============================================================
+
+PORTFOLIO SUMMARY
+----------------------------------------
+  Initial Balance:     $   10,000.00
+  Final Balance:       $    7,277.73
+  Total P&L:           $   -2,722.27
+  Annual Return:             -47.1%
+
+RISK METRICS
+----------------------------------------
+  Sharpe Ratio:               -0.45
+  Sortino Ratio:              -0.94
+  Max Drawdown:               58.1%
+  Calmar Ratio:               -0.81
+
+TRADE STATISTICS
+----------------------------------------
+  Total Trades:                1026
+  Win Rate:                   20.5%
+  Profit Factor:               0.90
+  Avg Win:             $      119.22
+  Avg Loss:            $       34.02
+  Win/Loss Ratio:              3.50
+  Max Concurrent:                 4
+
+STRATEGY BREAKDOWN
+----------------------------------------
+  ORB:
+    Trades: 157    | Win Rate:  47.8% | P&L: $ -772.78 | Avg: $  -4.92
+  HFT:
+    Trades: 461    | Win Rate:   4.8% | P&L: $-1323.30 | Avg: $  -2.87
+  SCALPER:
+    Trades: 55     | Win Rate:   7.3% | P&L: $  -85.00 | Avg: $  -1.55
+  QUANT:
+    Trades: 252    | Win Rate:  42.1% | P&L: $ -368.39 | Avg: $  -1.46
+  TICK_SCALPER:
+    Trades: 101    | Win Rate:   3.0% | P&L: $ -172.80 | Avg: $  -1.71
+
+============================================================

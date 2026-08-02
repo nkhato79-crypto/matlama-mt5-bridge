@@ -1,8 +1,7 @@
 """
 Matlama MT5 Bridge - VPS Component
-Runs on Windows VPS (173.225.110.145)
 Connects directly to MetaTrader5 and exposes HTTP endpoints
-Called by the Render.com bridge (matlama-mt5-bridge.onrender.com)
+Called by the cloud bridge
 """
 
 import os
@@ -22,7 +21,7 @@ app = Flask(__name__)
 MT5_LOGIN    = int(os.getenv("MT5_LOGIN", 0))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER   = os.getenv("MT5_SERVER", "FXPro-MT5")
-API_KEY      = os.getenv("API_KEY", "Yu4minawena#GOLD2025!")
+API_KEY      = os.getenv("API_KEY", "")
 SYMBOL       = "GOLD"
 LOT_SIZE     = float(os.getenv("LOT_SIZE", 0.01))
 MAGIC        = 20250101
@@ -120,9 +119,17 @@ def trade():
 
     if direction not in ("BUY", "SELL"):
         return jsonify({"error": "direction must be BUY or SELL"}), 400
+    if not (0.01 <= lot <= 10.0):
+        return jsonify({"error": "lot must be between 0.01 and 10.0"}), 400
+    if not (1 <= sl_pips <= 500):
+        return jsonify({"error": "sl_pips must be between 1 and 500"}), 400
+    if not (1 <= tp_pips <= 1000):
+        return jsonify({"error": "tp_pips must be between 1 and 1000"}), 400
 
     order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
     tick       = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return jsonify({"error": f"No tick data for {SYMBOL}"}), 503
     price      = tick.ask if direction == "BUY" else tick.bid
     pip        = mt5.symbol_info(SYMBOL).point * 10
     sl         = price - sl_pips * pip if direction == "BUY" else price + sl_pips * pip

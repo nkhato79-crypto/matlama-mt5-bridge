@@ -10,15 +10,20 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaQuant v1";
 input double   LotSize         = 0.01;
+input double   RiskPercent     = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      MagicNumber     = 20260201;
 input int      SL_Buffer       = 10;        // pips beyond Fib level for SL
 input int      PollSeconds     = 10;        // faster poll for reactive entries
 input double   MaxDailyLoss    = 100.0;
 input bool     AutoTrade       = true;
+input int      MaxTradesPerDay = 6;          // max entries per day (prevents overtrading)
+input int      CooldownSeconds = 300;        // 5-min cooldown between trades
 
 //--- Fibonacci Settings
 input int      SwingLookback   = 50;        // candles to look back for swing high/low
@@ -66,14 +71,34 @@ input double   SweepMinPips            = 5.0;    // min pips beyond swing level 
 input int      FVG_Lookback            = 30;     // M5 candles to scan for unfilled FVGs
 input double   FVG_MinGapPips          = 3.0;    // minimum FVG size in pips to be tradeable
 input double   SweepFVG_SL_BufferPips  = 8.0;    // SL buffer beyond the sweep level for override trades
-input bool     EnableContinuation      = true;   // allow sweep + fresh (unretested) FVG to fire a continuation entry
+input bool     EnableContinuation      = false;  // DISABLED — continuation contradicts reversal thesis (0% WR in demo)
 input int      ContinuationFVGMaxAge   = 5;      // max bars since FVG formed to still count as "fresh"
 input double   ContinuationSL_BufferPips = 5.0;  // SL buffer beyond the fresh FVG's near edge
+
+//--- False Sweep Continuation Filter (blocks exhausted moves)
+input bool     EnableFalseSweepFilter     = true;
+input double   MaxTravelFromSweepPips     = 40.0;  // max pips price can travel from sweep and still chase
+input double   MaxEMAExtensionATR         = 2.0;   // max ATR units from slow EMA — beyond = overextended
+input int      RSIDivergenceBars          = 5;     // M5 bars to check for momentum divergence
+input double   MinContinuationVolRatio    = 1.0;   // volume must be above average to confirm institutional flow
+input int      FalseSweepMinFails         = 2;     // block if this many exhaustion signals fire (out of 4)
+
+//--- Layer Confluence Override (fires when N of 5 layers agree, even without Sweep+FVG)
+input bool     EnableLayerOverride      = true;    // allow layer confluence to trigger trades
+input int      MinLayersToFire          = 3;       // minimum layers (of 5) needed to override ORCH HOLD
+
+//--- Entry Quality Filters (forensic-derived: reversal signals must fade momentum)
+input bool     EnableVelocityFilter     = true;    // block momentum-aligned entries (counter-momentum wins 86%)
+input double   MinVolumeRatio           = 0.20;    // minimum volume ratio to confirm institutional participation
+
+//--- TP Cap (prevents TP from being unreachable on wide SL distances)
+input double   MaxTP_ATR               = 1.5;     // cap TP1 at this multiple of ATR(14) — 0 = no cap
 
 //--- Global Variables
 CTrade   trade;
 datetime LastCheck      = 0;
 datetime EntryTime      = 0;
+datetime LastTradeTime  = 0;          // cooldown tracking
 double   dailyStartBalance;
 datetime dailyResetTime;
 int      rsiHandle;
@@ -103,6 +128,34 @@ int      TickCount      = 0;
 
 //--- CSV logging
 string   CSV_PATH = "quant_trades.csv";
+
+//+------------------------------------------------------------------+
+//| Count today's entries for this EA (MaxTradesPerDay enforcement)   |
+//+------------------------------------------------------------------+
+int QuantCountTradesToday()
+{
+   int count = 0;
+   datetime now = TimeGMT();
+   datetime dayStart = now - (now % 86400);
+   if(!HistorySelect(dayStart, now)) return 0;
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber &&
+         HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         count++;
+   }
+   // Also count currently open positions (they had an entry today too)
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetTicket(i) > 0 &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         PositionGetInteger(POSITION_TIME) >= dayStart)
+         count++;
+   }
+   return count;
+}
 
 //+------------------------------------------------------------------+
 //| Calculate Fibonacci levels from swing high/low                   |
@@ -525,6 +578,50 @@ bool CheckLiquiditySweepFVG(string &direction, double &sweepLevel,
 }
 
 //+------------------------------------------------------------------+
+//| Cap TP1 at MaxTP_ATR × current ATR to keep targets reachable.    |
+//| Gold's sweep/FVG structure can place SL far from entry, making   |
+//| R-multiple TPs unrealistic. ATR adapts to live volatility.       |
+//+------------------------------------------------------------------+
+double ClampTP(string direction, double currentPrice, double rawTP)
+{
+   if(MaxTP_ATR <= 0) return rawTP;
+
+   double atrCapBuf[];
+   ArraySetAsSeries(atrCapBuf, true);
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrCapBuf) < 1 || atrCapBuf[0] <= 0)
+      return rawTP;
+
+   double maxDist = MaxTP_ATR * atrCapBuf[0];
+
+   if(direction == "BUY")
+   {
+      double capped = currentPrice + maxDist;
+      if(rawTP > capped)
+      {
+         Print("TP CAP | BUY TP clamped from ", DoubleToString(rawTP, 2),
+               " to ", DoubleToString(capped, 2),
+               " (", DoubleToString(MaxTP_ATR, 1), " × ATR = ",
+               DoubleToString(maxDist / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10), 1), " pips)");
+         return capped;
+      }
+   }
+   else
+   {
+      double capped = currentPrice - maxDist;
+      if(rawTP < capped)
+      {
+         Print("TP CAP | SELL TP clamped from ", DoubleToString(rawTP, 2),
+               " to ", DoubleToString(capped, 2),
+               " (", DoubleToString(MaxTP_ATR, 1), " × ATR = ",
+               DoubleToString(maxDist / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10), 1), " pips)");
+         return capped;
+      }
+   }
+
+   return rawTP;
+}
+
+//+------------------------------------------------------------------+
 //| Trade levels for a Sweep+FVG override entry.                     |
 //| SL anchors to the swept liquidity level (the level that must NOT |
 //| be re-broken for the trade thesis to remain valid), not the      |
@@ -541,15 +638,15 @@ void GetSweepFVGTradeLevels(string direction, double sweepLevel,
    {
       sl  = sweepLevel - buffer;
       double risk = currentPrice - sl;
-      tp1 = currentPrice + 2.0 * risk;   // conservative 2R lock-in
-      tp2 = Fib236;                      // reuse existing Fib map for scale-out targets
+      tp1 = ClampTP(direction, currentPrice, currentPrice + 2.0 * risk);
+      tp2 = Fib236;
       tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
    }
    else
    {
       sl  = sweepLevel + buffer;
       double risk = sl - currentPrice;
-      tp1 = currentPrice - 2.0 * risk;
+      tp1 = ClampTP(direction, currentPrice, currentPrice - 2.0 * risk);
       tp2 = Ext127;
       tp3 = Ext162;
    }
@@ -667,9 +764,9 @@ void GetContinuationTradeLevels(string direction, double gapTop, double gapBotto
 
    if(direction == "BUY")
    {
-      sl  = gapBottom - buffer;   // near edge of the fresh gap
+      sl  = gapBottom - buffer;
       double risk = currentPrice - sl;
-      tp1 = currentPrice + 1.5 * risk;   // tighter target — chasing, not at a discount
+      tp1 = ClampTP(direction, currentPrice, currentPrice + 1.5 * risk);
       tp2 = SwingHigh;
       tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
    }
@@ -677,10 +774,119 @@ void GetContinuationTradeLevels(string direction, double gapTop, double gapBotto
    {
       sl  = gapTop + buffer;
       double risk = sl - currentPrice;
-      tp1 = currentPrice - 1.5 * risk;
+      tp1 = ClampTP(direction, currentPrice, currentPrice - 1.5 * risk);
       tp2 = SwingLow;
       tp3 = SwingLow - (SwingHigh - SwingLow) * 0.272;
    }
+}
+
+//+------------------------------------------------------------------+
+//| False Sweep Continuation Filter                                  |
+//| Blocks continuation entries when the move is exhausted:          |
+//|   1. Price already traveled too far from the sweep level         |
+//|   2. Price overextended from slow EMA (in ATR units)             |
+//|   3. RSI diverging from price (momentum not confirming)          |
+//|   4. Volume below average (institutions not participating)       |
+//| Returns true if the continuation looks FALSE and should be       |
+//| blocked.  Requires FalseSweepMinFails (default 2) to trigger.    |
+//+------------------------------------------------------------------+
+bool IsFalseSweepContinuation(string direction, double sweepLevel)
+{
+   if(!EnableFalseSweepFilter) return false;
+
+   int    failCount = 0;
+   double pipSize   = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   double price     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // --- Filter 1: Travel Distance ---
+   double travelPips = MathAbs(price - sweepLevel) / pipSize;
+   if(travelPips > MaxTravelFromSweepPips)
+   {
+      Print("FalseSweep [1] ✗ | Travel: ", DoubleToString(travelPips, 1),
+            " pips from sweep (max ", DoubleToString(MaxTravelFromSweepPips, 0), ")");
+      failCount++;
+   }
+   else
+      Print("FalseSweep [1] ✓ | Travel: ", DoubleToString(travelPips, 1), " pips — within range");
+
+   // --- Filter 2: EMA Extension ---
+   double emaSlBuf[];
+   ArraySetAsSeries(emaSlBuf, true);
+   double atrBuf2[];
+   ArraySetAsSeries(atrBuf2, true);
+   if(CopyBuffer(emaSlowHandle, 0, 0, 1, emaSlBuf) > 0 &&
+      CopyBuffer(atrHandle, 0, 0, 1, atrBuf2) > 0 && atrBuf2[0] > 0)
+   {
+      double emaDistance = MathAbs(price - emaSlBuf[0]);
+      double atrUnits   = emaDistance / atrBuf2[0];
+      if(atrUnits > MaxEMAExtensionATR)
+      {
+         Print("FalseSweep [2] ✗ | EMA extension: ", DoubleToString(atrUnits, 2),
+               " ATR from EMA26 (max ", DoubleToString(MaxEMAExtensionATR, 1), ")");
+         failCount++;
+      }
+      else
+         Print("FalseSweep [2] ✓ | EMA extension: ", DoubleToString(atrUnits, 2), " ATR — OK");
+   }
+
+   // --- Filter 3: RSI Divergence ---
+   double rsiBufDiv[];
+   ArraySetAsSeries(rsiBufDiv, true);
+   MqlRates divRates[];
+   ArraySetAsSeries(divRates, true);
+   if(CopyBuffer(rsiHandle, 0, 0, RSIDivergenceBars, rsiBufDiv) >= RSIDivergenceBars &&
+      CopyRates(_Symbol, PERIOD_M5, 0, RSIDivergenceBars, divRates) >= RSIDivergenceBars)
+   {
+      int last = RSIDivergenceBars - 1;
+      bool diverging = false;
+      if(direction == "BUY")
+      {
+         if(divRates[0].close > divRates[last].close && rsiBufDiv[0] < rsiBufDiv[last])
+            diverging = true;
+      }
+      else
+      {
+         if(divRates[0].close < divRates[last].close && rsiBufDiv[0] > rsiBufDiv[last])
+            diverging = true;
+      }
+
+      if(diverging)
+      {
+         Print("FalseSweep [3] ✗ | RSI divergence — momentum not confirming price");
+         failCount++;
+      }
+      else
+         Print("FalseSweep [3] ✓ | No RSI divergence — momentum aligned");
+   }
+
+   // --- Filter 4: Volume Fade ---
+   long volBufFS[];
+   ArraySetAsSeries(volBufFS, true);
+   if(CopyTickVolume(_Symbol, PERIOD_M5, 0, VolumePeriod + 1, volBufFS) >= VolumePeriod + 1)
+   {
+      double avgVol = 0;
+      for(int i = 1; i <= VolumePeriod; i++) avgVol += (double)volBufFS[i];
+      avgVol /= VolumePeriod;
+      double volRatio = (avgVol > 0) ? (double)volBufFS[0] / avgVol : 0;
+      if(volRatio < MinContinuationVolRatio)
+      {
+         Print("FalseSweep [4] ✗ | Volume fading: ", DoubleToString(volRatio, 2),
+               "x avg (need ", DoubleToString(MinContinuationVolRatio, 1), "x)");
+         failCount++;
+      }
+      else
+         Print("FalseSweep [4] ✓ | Volume: ", DoubleToString(volRatio, 2), "x avg — supported");
+   }
+
+   // --- Verdict ---
+   if(failCount >= FalseSweepMinFails)
+   {
+      Print("=== FALSE SWEEP CONTINUATION BLOCKED | ", failCount, "/4 exhaustion signals fired ===");
+      return true;
+   }
+
+   Print("FalseSweep ✓ | Only ", failCount, "/4 failed — continuation valid");
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -729,25 +935,25 @@ void GetTradeLevels(string direction, double nearestFib, string regime, double c
 
    if(direction == "BUY")
    {
-      sl  = nearestFib - buffer;         // SL below the Fib level we broke
+      sl  = nearestFib - buffer;
       double risk = currentPrice - sl;
       if(regime == "RANGE")
-         tp1 = currentPrice + 2.0 * risk;  // tight lock-in
+         tp1 = ClampTP(direction, currentPrice, currentPrice + 2.0 * risk);
       else
-         tp1 = Fib382;                     // next Fib up (TREND / other regimes)
-      tp2 = Fib236;                      // next Fib after that
-      tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272; // 127.2% extension
+         tp1 = ClampTP(direction, currentPrice, Fib382);
+      tp2 = Fib236;
+      tp3 = SwingHigh + (SwingHigh - SwingLow) * 0.272;
    }
    else
    {
-      sl  = nearestFib + buffer;         // SL above the Fib level we broke
+      sl  = nearestFib + buffer;
       double risk = sl - currentPrice;
       if(regime == "RANGE")
-         tp1 = currentPrice - 2.0 * risk;  // tight lock-in
+         tp1 = ClampTP(direction, currentPrice, currentPrice - 2.0 * risk);
       else
-         tp1 = Fib786;                     // next Fib down (TREND / other regimes)
-      tp2 = Ext127;                      // 127.2% extension
-      tp3 = Ext162;                      // 161.8% extension
+         tp1 = ClampTP(direction, currentPrice, Fib786);
+      tp2 = Ext127;
+      tp3 = Ext162;
    }
 }
 
@@ -756,10 +962,10 @@ void GetTradeLevels(string direction, double nearestFib, string regime, double c
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -806,7 +1012,7 @@ void LogClosedTrades()
    if(!hasNew) return;
 
    int handle = FileOpen(CSV_PATH,
-                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE) return;
    FileSeek(handle, 0, SEEK_END);
 
@@ -861,16 +1067,17 @@ void LogClosedTrades()
          velocityPipsLog = (velRates[0].close - velRates[2].close) / pipSizeLog;
       }
 
-      // Get volume ratio
+      // Get volume ratio — M5 to match live serving in OnTick
       long volBuf[];
       ArraySetAsSeries(volBuf, true);
       double volRatio = 0;
-      if(CopyTickVolume(_Symbol, PERIOD_M1, 0, VolumePeriod + 1, volBuf) >= VolumePeriod + 1)
+      if(CopyTickVolume(_Symbol, PERIOD_M5, 0, VolumePeriod + 1, volBuf) >= VolumePeriod + 1)
       {
          double avgVol = 0;
          for(int k = 1; k <= VolumePeriod; k++) avgVol += (double)volBuf[k];
          avgVol /= VolumePeriod;
-         volRatio = (double)volBuf[0] / avgVol;
+         if(avgVol > 0)
+            volRatio = (double)volBuf[0] / avgVol;
       }
 
       // Get RSI acceleration
@@ -965,12 +1172,15 @@ int OnInit()
    CalculateFibLevels();
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Symbol: ",       _Symbol);
    Print("AutoTrade: ",    AutoTrade ? "ENABLED" : "DISABLED");
    Print("Magic: ",        MagicNumber);
    Print("Strategy: Fibonacci Reactive | 5-Layer Confirmation");
    Print("CSV: quant_trades.csv");
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -1005,6 +1215,9 @@ void OnTick()
       Print("Daily balance reset: ", dailyStartBalance);
    }
 
+   // PropGuard tick-level checks (weekend close, emergency drawdown)
+   PropGuardOnTick();
+
    // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if((dailyStartBalance - currentBalance) >= MaxDailyLoss)
@@ -1027,6 +1240,18 @@ void OnTick()
    CalculateFibLevels();
 
    if(!AutoTrade) return;
+
+   // MaxTradesPerDay gate
+   if(QuantCountTradesToday() >= MaxTradesPerDay)
+   {
+      return;
+   }
+
+   // Cooldown between trades
+   if(LastTradeTime > 0 && (TimeCurrent() - LastTradeTime) < CooldownSeconds)
+   {
+      return;
+   }
 
    // Skip if already in a position
    for(int i = 0; i < PositionsTotal(); i++)
@@ -1090,11 +1315,13 @@ void OnTick()
 
    MqlRates fRates[]; ArraySetAsSeries(fRates, true);
    double velocityPips = 0;
+   double rawVelocityPips = 0;
    if(CopyRates(_Symbol, PERIOD_M1, 0, 5, fRates) >= 5)
    {
       double pipSizeV = SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
-      if(dirGuess == "BUY") velocityPips = (fRates[0].close - fRates[2].close) / pipSizeV;
-      else                  velocityPips = (fRates[2].close - fRates[0].close) / pipSizeV;
+      rawVelocityPips = (fRates[0].close - fRates[2].close) / pipSizeV;
+      if(dirGuess == "BUY") velocityPips = rawVelocityPips;
+      else                  velocityPips = -rawVelocityPips;
    }
 
    long volBuf3[]; ArraySetAsSeries(volBuf3, true);
@@ -1108,7 +1335,8 @@ void OnTick()
       double avgVolLive = 0;
       for(int k = 1; k <= VolumePeriod; k++) avgVolLive += (double)volBuf3[k];
       avgVolLive /= VolumePeriod;
-      volRatioLive = (double)volBuf3[0] / avgVolLive;
+      if(avgVolLive > 0)
+         volRatioLive = (double)volBuf3[0] / avgVolLive;
    }
 
    double rsiAccelLive = 0;
@@ -1174,20 +1402,33 @@ void OnTick()
          Print("=== SWEEP+FVG RETEST OVERRIDE | ORCH said HOLD, taking ", direction,
                " on Layer 6+7 confluence ===");
       }
-      // OR-path #2: continuation — sweep confirmed, but instead of waiting
-      // for a pullback that may never come, a fresh unfilled FVG in the
-      // same direction confirms the impulse itself has conviction, so we
-      // ride the move rather than only ever catching mean-reversions.
+      // OR-path #2 (disabled by default): continuation
       else if(EnableContinuation && CheckSweepContinuation(direction, sweepLevel, gapTop, gapBottom, fvgBarsAgo))
       {
+         if(IsFalseSweepContinuation(direction, sweepLevel))
+         {
+            Print("Signal: HOLD | Sweep continuation blocked — exhaustion detected");
+            return;
+         }
          isOverride   = true;
          overrideMode = "CONTINUATION";
          Print("=== SWEEP+CONTINUATION OVERRIDE | ORCH said HOLD, taking ", direction,
                " on sweep + fresh FVG (no retest required) ===");
       }
+      // OR-path #3: layer confluence — 3+ of the 5 original layers agree
+      // on direction, which is itself strong structural confirmation.
+      else if(EnableLayerOverride && confirmedLayers >= MinLayersToFire)
+      {
+         direction    = dirGuess;
+         isOverride   = true;
+         overrideMode = "LAYERS";
+         Print("=== LAYER CONFLUENCE OVERRIDE | ORCH said HOLD, taking ", direction,
+               " on ", confirmedLayers, "/5 layers confirming ===");
+      }
       else
       {
-         Print("Signal: HOLD | Orchestrator declined, no Sweep+FVG override available (retest or continuation)");
+         Print("Signal: HOLD | Orchestrator declined, no override available (retest/layers: ",
+               confirmedLayers, "/5)");
          return;
       }
    }
@@ -1196,13 +1437,8 @@ void OnTick()
       direction = dec.decision; // "BUY" or "SELL" — orchestrator is authoritative
    }
 
-   if(isOverride && !CheckDynamicSpread(sweepLevel))
+   if(isOverride && overrideMode != "LAYERS" && !CheckDynamicSpread(sweepLevel))
    {
-      // Reuse the existing dynamic spread guard for override trades too —
-      // the orchestrator path already applies its own spread check server-side,
-      // but the override path bypasses the orchestrator entirely so it needs
-      // this safety net applied locally. Distance is measured against the
-      // swept level itself, since that's the structural reference for this signal.
       Print(overrideMode, " override skipped | Spread too wide relative to structure");
       return;
    }
@@ -1210,13 +1446,45 @@ void OnTick()
    double distance;
    nearestFib = GetNearestFibLevel(price, distance);
 
-   if(isOverride)
+   if(isOverride && overrideMode == "LAYERS")
+      Print("=== LAYERS SIGNAL | Direction: ", direction,
+            " | Layers: ", confirmedLayers, "/5 | Fib: ", DoubleToString(nearestFib, 2), " ===");
+   else if(isOverride)
       Print("=== ", overrideMode, " SIGNAL | Direction: ", direction,
             " | Sweep level: ", DoubleToString(sweepLevel, 2),
             " | FVG: ", DoubleToString(gapBottom, 2), "-", DoubleToString(gapTop, 2), " ===");
    else
       Print("=== ORCHESTRATOR SIGNAL | Direction: ", direction,
             " | Confidence: ", DoubleToString(dec.confidence, 3), " ===");
+
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED trade | ", PropGuardStatus());
+      return;
+   }
+
+   if(EnableVelocityFilter)
+   {
+      if(direction == "BUY" && rawVelocityPips > 0)
+      {
+         Print("VELOCITY FILTER | BUY blocked — price rising (vel=", DoubleToString(rawVelocityPips, 1),
+               ") — reversal signals require counter-momentum entry");
+         return;
+      }
+      if(direction == "SELL" && rawVelocityPips < 0)
+      {
+         Print("VELOCITY FILTER | SELL blocked — price falling (vel=", DoubleToString(rawVelocityPips, 1),
+               ") — reversal signals require counter-momentum entry");
+         return;
+      }
+   }
+
+   if(volRatioLive < MinVolumeRatio)
+   {
+      Print("VOLUME FILTER | Blocked — vol ratio ", DoubleToString(volRatioLive, 2),
+            " < ", DoubleToString(MinVolumeRatio, 2));
+      return;
+   }
 
    double sl, tp1, tp2, tp3;
    if(overrideMode == "RETEST")
@@ -1227,8 +1495,9 @@ void OnTick()
       GetTradeLevels(direction, nearestFib, dec.regime, price, sl, tp1, tp2, tp3);
 
    string tradeComment = "";
-   if(overrideMode == "RETEST")       tradeComment = "_SWEEPFVG";
+   if(overrideMode == "RETEST")            tradeComment = "_SWEEPFVG";
    else if(overrideMode == "CONTINUATION") tradeComment = "_SWEEPCONT";
+   else if(overrideMode == "LAYERS")       tradeComment = "_LAYERS" + (string)confirmedLayers;
 
    string sourceTag = isOverride ? (" | Source: " + overrideMode + " OVERRIDE") : " | Source: ORCH";
    bool success = false;
@@ -1238,12 +1507,17 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
-      success = trade.Buy(LotSize, _Symbol, 0, sl, tp1, "MQ_BUY" + tradeComment);
+      double sl_pips = MathAbs(ask - sl) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips, PropGuardClampRisk(RiskPercent), LotSize);
+      success = trade.Buy(lot, _Symbol, 0, sl, tp1, "MQ_BUY" + tradeComment);
       if(success)
       {
+         PropGuardOnTrade();
          Print("BUY executed | Ask:", ask, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib, sourceTag);
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
+               " Lot:", DoubleToString(lot, 2), sourceTag);
          EntryTime = TimeCurrent();
+         LastTradeTime = TimeCurrent();
       }
       else Print("BUY failed: ", trade.ResultRetcodeDescription());
    }
@@ -1252,12 +1526,17 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       sl  = NormalizeDouble(sl,  _Digits);
       tp1 = NormalizeDouble(tp1, _Digits);
-      success = trade.Sell(LotSize, _Symbol, 0, sl, tp1, "MQ_SELL" + tradeComment);
+      double sl_pips = MathAbs(sl - bid) / (SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10);
+      double lot = CalcDynamicLot(_Symbol, sl_pips, PropGuardClampRisk(RiskPercent), LotSize);
+      success = trade.Sell(lot, _Symbol, 0, sl, tp1, "MQ_SELL" + tradeComment);
       if(success)
       {
+         PropGuardOnTrade();
          Print("SELL executed | Bid:", bid, " SL:", sl, " TP1:", tp1,
-               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib, sourceTag);
+               " TP2:", tp2, " TP3:", tp3, " | Fib:", nearestFib,
+               " Lot:", DoubleToString(lot, 2), sourceTag);
          EntryTime = TimeCurrent();
+         LastTradeTime = TimeCurrent();
       }
       else Print("SELL failed: ", trade.ResultRetcodeDescription());
    }

@@ -29,6 +29,11 @@ string OrchJsonGetString(string json, string key)
 {
    string pattern = "\"" + key + "\":\"";
    int pos = StringFind(json, pattern);
+   if(pos < 0)
+   {
+      pattern = "\"" + key + "\": \"";
+      pos = StringFind(json, pattern);
+   }
    if(pos < 0) return "";
    int start = pos + StringLen(pattern);
    int end   = StringFind(json, "\"", start);
@@ -42,6 +47,8 @@ double OrchJsonGetDouble(string json, string key)
    int pos = StringFind(json, pattern);
    if(pos < 0) return 0.0;
    int start = pos + StringLen(pattern);
+   // skip optional whitespace after colon
+   while(start < StringLen(json) && StringGetCharacter(json, start) == ' ') start++;
    int len   = StringLen(json);
    int end   = start;
    while(end < len)
@@ -118,6 +125,12 @@ OrchDecision OrchGetDecision(string server_url, string payload)
       int err = GetLastError();
       Print("ORCH ERROR | WebRequest failed. Code:", err,
             " — check Tools>Options>Expert Advisors>Allow WebRequest for: ", server_url);
+      return result;
+   }
+
+   if(res != 200)
+   {
+      Print("ORCH ERROR | HTTP ", res, " from ", server_url);
       return result;
    }
 

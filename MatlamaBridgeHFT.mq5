@@ -11,10 +11,13 @@
 
 #include <Trade\Trade.mqh>
 #include "OrchestratorClient.mqh"
+#include "DynamicLot.mqh"
+#include "PropFirmGuard.mqh"
 
 //--- Input Parameters
 input string   EA_Name         = "MatlamaBridgeHFT v2";
 input double   LotSize         = 0.01;
+input double   RiskPercent     = 1.0;          // % of equity risked per trade (0 = use fixed LotSize)
 input int      MagicNumber     = 20260102;
 input int      SL_Pips         = 30;           // tighter SL for HFT
 input int      TP_Pips         = 60;           // 1:2 RR minimum
@@ -287,10 +290,10 @@ bool RSIConfirms(string direction)
 //+------------------------------------------------------------------+
 void InitCSV()
 {
-   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+   int handle = FileOpen(CSV_PATH, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE)
    {
-      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI);
+      handle = FileOpen(CSV_PATH, FILE_WRITE|FILE_CSV|FILE_ANSI, ',');
       if(handle != INVALID_HANDLE)
       {
          FileWrite(handle,
@@ -328,7 +331,7 @@ void LogClosedTrades()
    if(!hasNew) return;
 
    int handle = FileOpen(CSV_PATH,
-                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ);
+                         FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
    if(handle == INVALID_HANDLE) return;
    FileSeek(handle, 0, SEEK_END);
 
@@ -447,10 +450,13 @@ int OnInit()
    CalculateFibLevels();
    InitCSV();
 
+   PropGuardInit();
+
    Print("=== ", EA_Name, " initialized ===");
    Print("Strategy: Stop Hunt + Momentum Burst at Fibonacci levels");
    Print("Max trades/day: ", MaxTradesPerDay);
    Print("Spike threshold: ", SpikeThreshold, " pips");
+   Print(PropGuardStatus());
 
    return(INIT_SUCCEEDED);
 }
@@ -484,6 +490,8 @@ void OnTick()
       dailyTradeCount   = 0;
       Print("HFT daily reset | Balance:", dailyStartBalance);
    }
+
+   PropGuardOnTick();
 
    // Daily loss limit
    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -619,10 +627,15 @@ void OnTick()
          " | Confidence: ", DoubleToString(dec.confidence, 3),
          " | Regime: ", dec.regime, " | Price: ", price);
 
-   double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double pipSize = point * 10;
+   if(!PropGuardCanTrade())
+   {
+      Print("PropGuard BLOCKED HFT trade | ", PropGuardStatus());
+      return;
+   }
+
    double sl_dist = SL_Pips * pipSize;
    double tp_dist = TP_Pips * pipSize;
+   double lot     = CalcDynamicLot(_Symbol, (double)SL_Pips, PropGuardClampRisk(RiskPercent), LotSize);
    bool   success = false;
 
    if(direction == "BUY")
@@ -630,11 +643,13 @@ void OnTick()
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double sl  = NormalizeDouble(ask - sl_dist, _Digits);
       double tp  = NormalizeDouble(ask + tp_dist, _Digits);
-      success    = trade.Buy(LotSize, _Symbol, 0, sl, tp, "HFT_BUY");
+      success    = trade.Buy(lot, _Symbol, 0, sl, tp, "HFT_BUY");
       if(success)
       {
+         PropGuardOnTrade();
          dailyTradeCount++;
          Print("HFT BUY | Ask:", ask, " SL:", sl, " TP:", tp,
+               " Lot:", DoubleToString(lot, 2),
                " | Type:", signalType, " Fib:", nearestFib);
       }
       else Print("HFT BUY failed: ", trade.ResultRetcodeDescription());
@@ -644,11 +659,13 @@ void OnTick()
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double sl  = NormalizeDouble(bid + sl_dist, _Digits);
       double tp  = NormalizeDouble(bid - tp_dist, _Digits);
-      success    = trade.Sell(LotSize, _Symbol, 0, sl, tp, "HFT_SELL");
+      success    = trade.Sell(lot, _Symbol, 0, sl, tp, "HFT_SELL");
       if(success)
       {
+         PropGuardOnTrade();
          dailyTradeCount++;
          Print("HFT SELL | Bid:", bid, " SL:", sl, " TP:", tp,
+               " Lot:", DoubleToString(lot, 2),
                " | Type:", signalType, " Fib:", nearestFib);
       }
       else Print("HFT SELL failed: ", trade.ResultRetcodeDescription());
