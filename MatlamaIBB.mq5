@@ -44,18 +44,20 @@ input double   RetestTolerancePips = 2.0;        // Price must come within this 
 
 //--- IB width filter (compare IB range to ATR to skip abnormal sessions)
 input bool     EnableIBWidthFilter = true;
-input double   IBMinWidthATR       = 0.3;        // Skip if IB < 30% of ATR (too narrow, likely whipsaw)
-input double   IBMaxWidthATR       = 1.5;        // Skip if IB > 150% of ATR (too wide, poor R:R)
+input double   IBMinWidthATR       = 0.4;        // Skip if IB < 40% of ATR (too narrow, whipsaw)
+input double   IBMaxWidthATR       = 1.0;        // Skip if IB > 100% of ATR (too wide, poor R:R)
 input int      ATRPeriod           = 14;
 
 //--- Risk & targets
 input double   LotSize             = 0.01;
 input double   RiskPercent         = 1.0;        // % of equity per trade (0 = fixed lot)
 input double   SLBufferPips        = 3.0;        // SL buffer beyond IB boundary
+input double   SLCap_ATR           = 1.0;        // cap SL distance at this × ATR (0 = no cap)
 input double   RR_TP1              = 1.0;        // TP1 at this × IB range extension
 input double   RR_TP2              = 2.0;        // TP2 (final) at this × IB range extension
 input double   TP1_ClosePercent    = 50.0;       // Close this % of position at TP1
 input int      MaxTradesPerDay     = 4;
+input bool     OneSidePerSession   = true;       // only take first breakout direction per IB
 
 //--- Trailing stop
 input bool     EnableTrailing      = true;
@@ -420,6 +422,9 @@ void CheckBreakoutEntries(int s)
    if(!PropGuardCanTrade()) return;
    if(!PassesSpreadFilter()) return;
 
+   //--- One-side-per-session: if either direction already taken, skip both
+   if(OneSidePerSession && (longTaken[s] || shortTaken[s])) return;
+
    //--- LONG breakout
    if(!longTaken[s] && longBreakoutSeen[s] && ask > ibHigh[s])
    {
@@ -427,6 +432,23 @@ void CheckBreakoutEntries(int s)
       if(!CheckRetestEntry("BUY", s)) return;
 
       double sl = ibLow[s] - buffer;
+
+      //--- SL cap: prevent oversized SL when IB range is wide
+      if(SLCap_ATR > 0)
+      {
+         double atrNow = GetATR();
+         if(atrNow > 0)
+         {
+            double maxSLDist = SLCap_ATR * atrNow;
+            if(ask - sl > maxSLDist)
+            {
+               Print(EA_Name, " | SL CAP | BUY SL capped from ", DoubleToString(sl, 2),
+                     " to ", DoubleToString(ask - maxSLDist, 2));
+               sl = ask - maxSLDist;
+            }
+         }
+      }
+
       double tp1 = ask + (ibRange * RR_TP1);
       double tp2 = ask + (ibRange * RR_TP2);
 
@@ -467,6 +489,23 @@ void CheckBreakoutEntries(int s)
       if(!CheckRetestEntry("SELL", s)) return;
 
       double sl = ibHigh[s] + buffer;
+
+      //--- SL cap
+      if(SLCap_ATR > 0)
+      {
+         double atrNow = GetATR();
+         if(atrNow > 0)
+         {
+            double maxSLDist = SLCap_ATR * atrNow;
+            if(sl - bid > maxSLDist)
+            {
+               Print(EA_Name, " | SL CAP | SELL SL capped from ", DoubleToString(sl, 2),
+                     " to ", DoubleToString(bid + maxSLDist, 2));
+               sl = bid + maxSLDist;
+            }
+         }
+      }
+
       double tp1 = bid - (ibRange * RR_TP1);
       double tp2 = bid - (ibRange * RR_TP2);
 
