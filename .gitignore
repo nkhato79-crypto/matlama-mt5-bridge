@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+
+# MT5 bridge outputs — contain account data and raw MCP responses
+mt5_check_raw.json
+mt5_export_raw_*.json
