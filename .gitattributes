@@ -1,0 +1,16 @@
+# cmd.exe seeks through a .bat file by byte offset while it runs. With LF-only
+# line endings that offset drifts, and the interpreter resumes mid-token on a
+# later line — which is how `git pull origin ...` turned into `'igin' is not
+# recognized` on the VPS. Windows scripts must be checked out with CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# MQL5 sources are edited in MetaEditor on Windows.
+*.mq5 text eol=crlf
+*.mqh text eol=crlf
+
+# Everything else stays LF.
+*.py  text eol=lf
+*.md  text eol=lf
+*.csv text eol=lf

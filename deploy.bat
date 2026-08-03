@@ -1,6 +1,6 @@
 @echo off
 REM ================================================================
-REM  Matlama Deploy Script — ORB + QUANT + IBB + HA Mode
+REM  Matlama Deploy Script - ORB + QUANT + IBB + HA Mode
 REM  Pulls latest code, copies ORB + QUANT + IBB + HA + support files to MT5,
 REM  restarts Swarm.
 REM ================================================================
@@ -17,7 +17,7 @@ set METAEDITOR="%MT5_TERMINAL%\metaeditor64.exe"
 
 echo.
 echo ========================================
-echo   Matlama Deploy — ORB + QUANT + IBB + HA Mode
+echo   Matlama Deploy - ORB + QUANT + IBB + HA Mode
 echo   %date% %time%
 echo ========================================
 echo.
@@ -154,9 +154,9 @@ if errorlevel 1 (
 echo.
 echo ========================================
 if %ALL_OK%==1 (
-    echo   DEPLOYMENT COMPLETE — All services UP
+    echo   DEPLOYMENT COMPLETE - All services UP
 ) else (
-    echo   DEPLOYMENT COMPLETE — Some services still starting
+    echo   DEPLOYMENT COMPLETE - Some services still starting
     echo   The Swarm Supervisor will auto-restart them.
     echo   Run /status in Telegram to check.
 )

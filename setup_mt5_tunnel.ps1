@@ -120,7 +120,7 @@ Write-Host "  `$env:ANTHROPIC_API_KEY = `"<key from console.anthropic.com>`""
 Write-Host ""
 Write-Host "Then:  python mt5_claude_bridge.py check"
 Write-Host ""
-Write-Host "Quick-tunnel hostnames are ephemeral — restarting cloudflared issues a new one."
+Write-Host "Quick-tunnel hostnames are ephemeral - restarting cloudflared issues a new one."
 Write-Host "Leave this window open for as long as you need the link." -ForegroundColor Yellow
 
 $env:MT5_MCP_URL = $mcpUrl
