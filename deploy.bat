@@ -1,7 +1,7 @@
 @echo off
 REM ================================================================
-REM  Matlama Deploy Script — ORB + QUANT + IBB Mode
-REM  Pulls latest code, copies ORB + QUANT + IBB + support files to MT5,
+REM  Matlama Deploy Script — ORB + QUANT + IBB + HA Mode
+REM  Pulls latest code, copies ORB + QUANT + IBB + HA + support files to MT5,
 REM  restarts Swarm.
 REM ================================================================
 
@@ -17,7 +17,7 @@ set METAEDITOR="%MT5_TERMINAL%\metaeditor64.exe"
 
 echo.
 echo ========================================
-echo   Matlama Deploy — ORB + QUANT + IBB Mode
+echo   Matlama Deploy — ORB + QUANT + IBB + HA Mode
 echo   %date% %time%
 echo ========================================
 echo.
@@ -36,7 +36,7 @@ if errorlevel 1 (
 echo      Done.
 echo.
 
-REM --- Step 2: Copy ORB + QUANT + support files to MT5 ---
+REM --- Step 2: Copy ORB + QUANT + IBB + HA + support files to MT5 ---
 echo [2/5] Copying EA files to MetaTrader...
 if not exist "%MT5_EXPERTS%" mkdir "%MT5_EXPERTS%"
 
@@ -44,6 +44,7 @@ for %%f in (
     MatlamaORB.mq5
     MatlamaQuant.mq5
     MatlamaIBB.mq5
+    MatlamaHAMomentum.mq5
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
     OrchestratorClient.mqh
@@ -74,6 +75,7 @@ for %%f in (
     MatlamaORB.mq5
     MatlamaQuant.mq5
     MatlamaIBB.mq5
+    MatlamaHAMomentum.mq5
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
 ) do (
@@ -160,9 +162,10 @@ if %ALL_OK%==1 (
 )
 echo ========================================
 echo.
-echo  ORB + QUANT + IBB MODE: Attach MatlamaORB,
-echo  MatlamaQuant, and MatlamaIBB to your charts.
-echo  MatlamaIBB goes on XAUUSD chart.
+echo  ORB + QUANT + IBB + HA MODE: Attach MatlamaORB,
+echo  MatlamaQuant, MatlamaIBB and MatlamaHAMomentum
+echo  to your charts. MatlamaIBB and MatlamaHAMomentum
+echo  both go on the GOLD chart.
 echo  Remove all other EAs from MT5 if still attached:
 echo    - MatlamaScalper
 echo    - MatlamaTickScalper
