@@ -71,6 +71,12 @@ if not exist %METAEDITOR% (
 
 if not exist "%REPO_DIR%\logs" mkdir "%REPO_DIR%\logs"
 
+set COMPILE_ERRORS=0
+
+REM The old .ex5 is deleted before each build, so its presence afterwards
+REM proves a fresh compile rather than a leftover from a previous deploy.
+REM MetaEditor writes its log as UTF-16, which findstr cannot read, so
+REM PowerShell dumps the error lines when a build fails.
 for %%f in (
     MatlamaORB.mq5
     MatlamaQuant.mq5
@@ -79,24 +85,25 @@ for %%f in (
     MatlamaFundamentals.mq5
     MatlamaMonitor.mq5
 ) do (
-    echo      Compiling %%f...
+    if exist "%MT5_EXPERTS%\%%~nf.ex5" del /q "%MT5_EXPERTS%\%%~nf.ex5"
+
     %METAEDITOR% /compile:"%MT5_EXPERTS%\%%f" /log:"%REPO_DIR%\logs\compile_%%~nf.log" /include:"%MT5_EXPERTS%"
+
+    if exist "%MT5_EXPERTS%\%%~nf.ex5" (
+        echo      OK       %%f
+    ) else (
+        echo      FAILED   %%f
+        set /a COMPILE_ERRORS=COMPILE_ERRORS+1
+        powershell -NoProfile -Command "if (Test-Path '%REPO_DIR%\logs\compile_%%~nf.log') { Get-Content '%REPO_DIR%\logs\compile_%%~nf.log' | Select-String -Pattern 'error' | Select-Object -First 15 | ForEach-Object { '           ' + $_.Line.Trim() } }"
+    )
 )
 
 echo      Compile logs saved to %REPO_DIR%\logs\
-echo      Done.
 
-REM Check for compile errors
-set COMPILE_ERRORS=0
-for %%f in ("%REPO_DIR%\logs\compile_*.log") do (
-    findstr /i "error" "%%f" >nul 2>&1
-    if not errorlevel 1 (
-        echo      WARNING: Compile errors in %%~nxf
-        set /a COMPILE_ERRORS=COMPILE_ERRORS+1
-    )
-)
-if not %COMPILE_ERRORS%==0 (
-    echo      Review compile logs before proceeding.
+if not "!COMPILE_ERRORS!"=="0" (
+    echo.
+    echo      !COMPILE_ERRORS! EA file/s failed to compile.
+    echo      Do NOT attach a failed EA - it has no .ex5 to load.
     echo.
 )
 
