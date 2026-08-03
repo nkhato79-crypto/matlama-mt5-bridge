@@ -99,6 +99,7 @@ input double          DojiBodyATR         = 0.10;       // Body below this x ATR
 input bool            EnableTrailing      = true;
 input double          TrailATRMultiple    = 1.5;
 input double          TrailActivationR    = 1.0;        // Start trailing after this many R
+input double          TrailStepPips       = 5.0;        // Minimum SL improvement before re-modifying
 
 //--- Execution guards
 input int             MaxTradesPerDay     = 6;
@@ -681,8 +682,12 @@ void ManageOpenPositions(const HACandle &ha[], double atr, bool newBar)
       //--- ATR trailing stop, activated after TrailActivationR
       if(EnableTrailing && atr > 0)
       {
-         double trailDist = atr * TrailATRMultiple;
+         double trailDist  = atr * TrailATRMultiple;
          double activation = risk * TrailActivationR;
+
+         //--- Without a minimum step the stop ratchets on every tick, which
+         //--- floods the broker with modify requests for a fraction of a pip.
+         double trailStep = TrailStepPips * PipSize();
 
          if(isBuy)
          {
@@ -690,7 +695,7 @@ void ManageOpenPositions(const HACandle &ha[], double atr, bool newBar)
             {
                double newSL = NormPrice(bid - trailDist);
                newSL = EnforceStopDistance(bid, newSL, true);
-               if(newSL > curSL && newSL < bid)
+               if(newSL < bid && (curSL == 0 || newSL >= curSL + trailStep))
                   trade.PositionModify(ticket, newSL, curTP);
             }
          }
@@ -700,7 +705,7 @@ void ManageOpenPositions(const HACandle &ha[], double atr, bool newBar)
             {
                double newSL = NormPrice(ask + trailDist);
                newSL = EnforceStopDistance(ask, newSL, false);
-               if((newSL < curSL || curSL == 0) && newSL > ask)
+               if(newSL > ask && (curSL == 0 || newSL <= curSL - trailStep))
                   trade.PositionModify(ticket, newSL, curTP);
             }
          }
