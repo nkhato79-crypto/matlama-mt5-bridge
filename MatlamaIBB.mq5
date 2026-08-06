@@ -49,8 +49,9 @@ input double   IBMaxWidthATR       = 1.0;        // Skip if IB > 100% of ATR (to
 input int      ATRPeriod           = 14;
 
 //--- Risk & targets
+input bool     UseFixedLot         = true;       // Always trade LotSize; ignore RiskPercent
 input double   LotSize             = 0.01;
-input double   RiskPercent         = 1.0;        // % of equity per trade (0 = fixed lot)
+input double   RiskPercent         = 1.0;        // % of equity per trade (ignored when UseFixedLot)
 input double   SLBufferPips        = 3.0;        // SL buffer beyond IB boundary
 input double   SLCap_ATR           = 1.0;        // cap SL distance at this × ATR (0 = no cap)
 input double   RR_TP1              = 1.0;        // TP1 at this × IB range extension
@@ -142,7 +143,9 @@ int OnInit()
          " | NY ", NYStartHour, ":", NYStartMin,
          " | IB Window:", IBWindowMins, "min",
          " | Retest:", EnableRetestEntry,
-         " | Trail:", EnableTrailing);
+         " | Trail:", EnableTrailing,
+         " | Sizing:", (UseFixedLot ? "FIXED " + DoubleToString(LotSize, 2) + " lots"
+                                    : "RISK " + DoubleToString(RiskPercent, 2) + "%"));
    Print(PropGuardStatus());
    return(INIT_SUCCEEDED);
 }
@@ -178,6 +181,26 @@ double GetATR()
 double PipSize()
 {
    return SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+}
+
+//+------------------------------------------------------------------+
+//  Fixed lot means risk per trade varies with stop distance. That is
+//  deliberate while we are measuring the strategy rather than sizing it.
+double ResolveLot(double slPips)
+{
+   double lot = UseFixedLot
+                ? LotSize
+                : CalcDynamicLot(_Symbol, slPips, PropGuardClampRisk(RiskPercent), LotSize);
+
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lotStep > 0) lot = MathRound(lot / lotStep) * lotStep;
+   if(lot < minLot) lot = minLot;
+   if(lot > maxLot) lot = maxLot;
+
+   return NormalizeDouble(lot, 2);
 }
 
 //+------------------------------------------------------------------+
@@ -453,7 +476,7 @@ void CheckBreakoutEntries(int s)
       double tp2 = ask + (ibRange * RR_TP2);
 
       double slPips = PriceToPips(ask - sl);
-      double lot = CalcDynamicLot(_Symbol, slPips, PropGuardClampRisk(RiskPercent), LotSize);
+      double lot = ResolveLot(slPips);
 
       trade.SetExpertMagicNumber(MagicIBB);
 
@@ -510,7 +533,7 @@ void CheckBreakoutEntries(int s)
       double tp2 = bid - (ibRange * RR_TP2);
 
       double slPips = PriceToPips(sl - bid);
-      double lot = CalcDynamicLot(_Symbol, slPips, PropGuardClampRisk(RiskPercent), LotSize);
+      double lot = ResolveLot(slPips);
 
       trade.SetExpertMagicNumber(MagicIBB);
 

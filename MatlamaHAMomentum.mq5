@@ -81,8 +81,9 @@ input int             ADXPeriod           = 14;
 input double          MinADX              = 20.0;
 
 //--- Risk & targets
+input bool            UseFixedLot         = true;       // Always trade LotSize; ignore RiskPercent
 input double          LotSize             = 0.01;
-input double          RiskPercent         = 1.0;        // % equity per trade (0 = fixed lot)
+input double          RiskPercent         = 1.0;        // % equity per trade (ignored when UseFixedLot)
 input ENUM_HA_SL      SLMode              = HA_SL_ATR;
 input double          SLATRMultiple       = 1.5;        // SL distance when SLMode = ATR
 input double          SLBufferPips        = 3.0;        // Extra buffer in SIGNAL_CANDLE mode
@@ -167,7 +168,9 @@ int OnInit()
          " | HTF:", (UseHTFFilter ? EnumToString(HTF) : "off"),
          " | Mode:", (EntryMode == HA_ENTRY_FLIP ? "FLIP" : "STREAK x" + (string)StreakCandles),
          " | MinBody:", DoubleToString(MinBodyATR, 2), "xATR",
-         " | Trail:", EnableTrailing);
+         " | Trail:", EnableTrailing,
+         " | Sizing:", (UseFixedLot ? "FIXED " + DoubleToString(LotSize, 2) + " lots"
+                                    : "RISK " + DoubleToString(RiskPercent, 2) + "%"));
    Print(PropGuardStatus());
    return(INIT_SUCCEEDED);
 }
@@ -271,6 +274,26 @@ double PriceToPips(double distance)
    double ps = PipSize();
    if(ps <= 0) return 0;
    return distance / ps;
+}
+
+//+------------------------------------------------------------------+
+//  Fixed lot means risk per trade varies with stop distance. That is
+//  deliberate while we are measuring the strategy rather than sizing it.
+double ResolveLot(double slPips)
+{
+   double lot = UseFixedLot
+                ? LotSize
+                : CalcDynamicLot(_Symbol, slPips, PropGuardClampRisk(RiskPercent), LotSize);
+
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lotStep > 0) lot = MathRound(lot / lotStep) * lotStep;
+   if(lot < minLot) lot = minLot;
+   if(lot > maxLot) lot = maxLot;
+
+   return NormalizeDouble(lot, 2);
 }
 
 //+------------------------------------------------------------------+
@@ -545,7 +568,7 @@ void OpenTrade(string dir, const HACandle &ha[], double atr)
    tp = NormPrice(tp);
 
    double slPips = PriceToPips(risk);
-   double lot = CalcDynamicLot(_Symbol, slPips, PropGuardClampRisk(RiskPercent), LotSize);
+   double lot = ResolveLot(slPips);
 
    trade.SetExpertMagicNumber(MagicHA);
    string comment = EA_Name + " " + dir;
